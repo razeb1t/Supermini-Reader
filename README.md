@@ -64,7 +64,7 @@ String AP_PASS = "12345678";
 | Текстолит (двухсторонний) | [OZON](https://ozon.ru/t/EIpMMhm) |
 | Преобразователь 5v,8v,9v,12v |[AliExpress](https://ali.click/431kk1u)|
 | TP4056 |[AliExpress](https://ali.click/2v3xl17)|
-| Аккумулятор (любой, рекомендуется 042025) |[Ozon](https://ozon.ru/t/9oJKbuo)|
+| Аккумулятор (любой, рекомендуется 042025) |[Ozon](https://ozon.ru/t/sXkcoqy)|
 
  ---
 
