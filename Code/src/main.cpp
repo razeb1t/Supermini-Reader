@@ -13,15 +13,16 @@ namespace cfg {
 constexpr uint8_t PIN_SDA = 11, PIN_SCL = 13, PIN_UP = 5, PIN_DOWN = 7, PIN_OK = 6;
 constexpr int SCREEN_ROWS = 8;         // строк текста на экране
 constexpr int CHARS_PER_LINE = 21;     // символов в строке
-constexpr int PATH_LEN = 96;           // макс. длина пути в байтах (кириллица = 2 байта на букву)
-constexpr int TITLE_LEN = 72;          // макс. длина заголовка в списке
-constexpr int MAX_FILES = 64;          // файлов в одной папке (лишние не показываются)
-constexpr int MAX_PAGES = 512;         // страниц в одном файле (по 8 строк)
+constexpr int PATH_LEN = 128;          // макс. длина пути в байтах (кириллица = 2 байта на букву)
+constexpr int TITLE_LEN = 96;          // макс. длина заголовка в списке
+constexpr int MAX_FILES = 256;         // файлов в одной папке (лишние не показываются)
+constexpr int MAX_PAGES = 4096;        // страниц в одном файле (по 8 строк)
+constexpr int MAX_MARKS = 64;          // макс. выделенных для удаления
 constexpr size_t IMG_BYTES = 1024;     // 128x64 бит
 constexpr uint32_t SCROLL_MS = 300;    // скорость бегущей строки
 constexpr uint32_t SAVE_DELAY_MS = 800;
 constexpr const char *SETTINGS_PATH = "/_cfg.txt";
-}
+}  
 
 using Oled = GyverOLED<SSD1306_128x64, OLED_BUFFER>;
 
@@ -40,7 +41,6 @@ inline bool safeChars(const char *s) {
   }
   return true;
 }
-
 inline bool safePath(const char *p) {
   return p && p[0] == '/' && strlen(p) < (size_t)cfg::PATH_LEN && !strstr(p, "..") && safeChars(p);
 }
@@ -105,6 +105,7 @@ namespace fsx {
 inline bool hasSpace(long extra) {
   return (long)LittleFS.totalBytes() - (long)LittleFS.usedBytes() - extra > 512;
 }
+// вызывает fn(путь, файл) для каждого элемента папки (служебный файл настроек пропускается)
 template <class Fn> void scanDir(const char *dir, Fn fn) {
   File root = LittleFS.open(dir);
   if (!root) return;
@@ -117,6 +118,7 @@ template <class Fn> void scanDir(const char *dir, Fn fn) {
     f = root.openNextFile();
   }
 }
+
 inline size_t readLine(File &f, char *buf, size_t cap) {
   size_t n = f.readBytesUntil('\n', buf, cap - 1);
   buf[n] = 0;
@@ -127,7 +129,7 @@ inline size_t readLine(File &f, char *buf, size_t cap) {
   return n;
 }
 inline bool removeDirRecursive(const char *path, int depth = 0) {
-  if (depth > 8) return false;  // защита стека
+  if (depth > 8) return false;  
   char child[cfg::PATH_LEN * 2];
   bool ok = true;
   for (;;) {
@@ -151,24 +153,20 @@ inline bool removeDirRecursive(const char *path, int depth = 0) {
   return LittleFS.rmdir(path) && ok;
 }
 }  
+
 class Button {
  public:
   void begin(uint8_t p) {
     pin = p;
     pinMode(pin, INPUT_PULLUP);
-    bool on = digitalRead(pin) == LOW;
-    counter = on ? DEBOUNCE_MAX : 0;
-    stable = on;
+    stable = lastRaw = digitalRead(pin) == LOW;
   }
-  void update(uint32_t now) {
+  void update(uint32_t now) {  // антидребезг по времени, а не по числу циклов
     pressed = released = longPress = repeat = false;
-    if (digitalRead(pin) == LOW) { if (counter < DEBOUNCE_MAX) counter++; }
-    else if (counter > 0) counter--;
-    bool s = stable;
-    if (counter >= DEBOUNCE_MAX) s = true;
-    else if (counter <= 0) s = false;
-    if (s != stable) {
-      stable = s;
+    bool raw = digitalRead(pin) == LOW;
+    if (raw != lastRaw) { lastRaw = raw; rawAt = now; }
+    if (raw != stable && now - rawAt >= DEBOUNCE_MS) {
+      stable = raw;
       if (stable) { tPress = tRepeat = now; longFired = false; pressed = true; }
       else released = true;
     }
@@ -178,15 +176,13 @@ class Button {
       if (held >= REPEAT_START_MS && now - tRepeat >= REPEAT_MS) { tRepeat = now; repeat = true; }
     }
   }
-  // состояние и события последнего update()
   bool stable = false, pressed = false, released = false, longPress = false, repeat = false, longFired = false;
 
  private:
-  enum { DEBOUNCE_MAX = 6 };
-  static const uint32_t LONGPRESS_MS = 600, REPEAT_START_MS = 500, REPEAT_MS = 180;
+  static const uint32_t DEBOUNCE_MS = 12, LONGPRESS_MS = 600, REPEAT_START_MS = 500, REPEAT_MS = 180;
   uint8_t pin = 0;
-  int counter = 0;
-  uint32_t tPress = 0, tRepeat = 0;
+  bool lastRaw = false;
+  uint32_t rawAt = 0, tPress = 0, tRepeat = 0;
 };
 
 class Settings {
@@ -196,6 +192,7 @@ class Settings {
   bool sleepEnabled = false;
   int sleepMin = 0, sleepSec = 0;
   int webTheme = 0;
+  int best = 0;  // рекорд Flappy Bird
   char ssid[33];
   char pass[65];
   char lastFile[cfg::PATH_LEN];
@@ -216,9 +213,9 @@ class Settings {
     if (!LittleFS.exists(cfg::SETTINGS_PATH)) return;
     File f = LittleFS.open(cfg::SETTINGS_PATH, "r");
     if (!f) return;
-    char l[9][cfg::PATH_LEN];
+    char l[10][cfg::PATH_LEN];
     int got = 0;
-    while (got < 9 && f.available()) {
+    while (got < 10 && f.available()) {
       fsx::readLine(f, l[got], cfg::PATH_LEN);
       str::trim(l[got]);
       got++;
@@ -233,6 +230,7 @@ class Settings {
     if (got > 6 && l[6][0]) sleepSec = constrain(atoi(l[6]), 0, 59);
     if (got > 7 && l[7][0]) sleepEnabled = atoi(l[7]) == 1;
     if (got > 8 && l[8][0]) webTheme = constrain(atoi(l[8]), 0, 8);
+    if (got > 9 && l[9][0]) best = constrain(atoi(l[9]), 0, 99999);
   }
   void save() const {
     File f = LittleFS.open(cfg::SETTINGS_PATH, "w");
@@ -246,6 +244,7 @@ class Settings {
     f.println(sleepSec);
     f.println(sleepEnabled ? 1 : 0);
     f.println(webTheme);
+    f.println(best);
     f.close();
   }
 
@@ -258,7 +257,6 @@ class Calculator {
  public:
   Calculator() { reset(); }
   void reset() { disp[0] = 0; result[0] = 0; sel = 0; }
-
   void moveSel(int dir) {
     int row = sel / COLS, col = sel % COLS;
     int v = col * ROWS + row + dir;
@@ -266,6 +264,8 @@ class Calculator {
     if (v >= ROWS * COLS) v = 0;
     sel = (v % ROWS) * COLS + v / ROWS;
   }
+  const char *text() const { return disp; }
+  const char *selectedKey() const { return KEYS[sel / COLS][sel % COLS]; }
   void pressSelected() { press(KEYS[sel / COLS][sel % COLS]); }
 
   void press(const char *key) {
@@ -289,6 +289,7 @@ class Calculator {
     }
   }
 
+  // вычисление строки без UI (удобно для проверки)
   static bool eval(const char *text, double &out) {
     Parser p(text);
     out = p.expr();
@@ -337,7 +338,6 @@ class Calculator {
   char disp[24];
   char result[24];
   int sel;
-
   struct Parser {
     const char *s;
     bool error;
@@ -414,7 +414,8 @@ const char *const Calculator::KEYS[Calculator::ROWS][Calculator::COLS] = {
   {"7", "8", "9", "/"},
   {"4", "5", "6", "*"},
   {"1", "2", "3", "-"},
-  {"0", ".", "=", "+"}};
+  {"0", ".", "=", "+"}
+};
 
 class LineReader {
  public:
@@ -427,8 +428,6 @@ class LineReader {
   }
   uint32_t position() const { return pos; }
   void skipLine() { int c; while ((c = readByte()) != -1 && c != '\n') {} }
-
-  // очередная строка экрана; startOff - смещение её первого байта в файле
   bool nextLine(char *line, size_t cap, uint32_t *startOff) {
     line[0] = 0;
     int lc = 0;
@@ -486,7 +485,7 @@ class LineReader {
       if (c == ' ' || c == '\r') break;
       if (c == '\n') { wbreak = true; break; }
       bool lead = !u8::isCont((uint8_t)c);
-      if (lead && wchars >= cfg::CHARS_PER_LINE) { unread(); break; }  // длинное слово режем между буквами
+      if (lead && wchars >= cfg::CHARS_PER_LINE) { unread(); break; }  
       if (wbytes < (int)sizeof word - 1) word[wbytes++] = (char)c;
       if (lead) wchars++;
       c = readByte();
@@ -509,8 +508,19 @@ class Reader {
     if (!f) return;
     LineReader lr;
     lr.begin(f, 0);
-    lr.skipLine();  // первая строка - заголовок
+    lr.skipLine();  
     pageOff[0] = lr.position();
+  }
+  void openImage(const char *path) {
+    strlcpy(file, path, sizeof file);
+    isImage = true;
+    imgOk = false;
+    File f = LittleFS.open(file, "r");
+    if (!f) return;
+    size_t n = f.read(img, cfg::IMG_BYTES);
+    f.close();
+    if (n < cfg::IMG_BYTES) memset(img + n, 0, cfg::IMG_BYTES - n);
+    imgOk = true;
   }
   bool next() {
     if (!hasNext || page + 1 >= cfg::MAX_PAGES) return false;
@@ -523,6 +533,11 @@ class Reader {
     return true;
   }
   void draw(Oled &oled) {
+    if (isImage) {
+      if (!imgOk) { msg(oled, "Ошибка чтения"); return; }
+      oled.drawBitmap(0, 0, img, 128, 64);
+      return;
+    }
     File f = LittleFS.open(file, "r");
     if (!f) { msg(oled, "Ошибка чтения"); return; }
     LineReader lr;
@@ -548,6 +563,8 @@ class Reader {
   bool hasNext = false;
   uint32_t nextOff = 0;
   uint32_t pageOff[cfg::MAX_PAGES];  // начало каждой посещённой страницы
+  bool imgOk = false;
+  uint8_t img[cfg::IMG_BYTES];
   static void msg(Oled &oled, const char *t) { oled.setCursor(0, 3); oled.print(t); }
 };
 
@@ -575,6 +592,9 @@ class FileBrowser {
         snprintf(t, sizeof t, "[%s]", name);
         add(p, t, true, false);
       }
+      else if (str::endsWith(p, ".h")) {
+        add(p, name, false, true);
+      }
       else {
         fsx::readLine(f, t, sizeof t);
         str::trim(t);
@@ -598,18 +618,57 @@ class FileBrowser {
     if (sel >= n) sel = 0;
     scrollPos = 0;
   }
+  // открыть папку последнего файла и встать на него
+  void openAt(const char *p) {
+    if (p[0] && LittleFS.exists(p)) {
+      strlcpy(dir, p, sizeof dir);
+      char *sl = strrchr(dir, '/');
+      if (sl) sl[1] = 0; else strcpy(dir, "/");
+    }
+    refresh();
+    selectByPath(p);
+  }
+  // если текущая папка удалена - подняться до существующей
+  void fixDir() {
+    char t[sizeof dir];
+    while (strcmp(dir, "/")) {
+      strlcpy(t, dir, sizeof t);
+      t[strlen(t) - 1] = 0;
+      if (LittleFS.exists(t)) break;
+      char *sl = strrchr(t, '/');
+      if (sl) sl[1] = 0; else strcpy(t, "/");
+      strcpy(dir, t);
+      sel = 0; top = 0;
+    }
+    refresh();
+  }
+  // выделение для удаления
+  void beginMark() { markMode = true; nMarks = 0; }
+  void endMark() { markMode = false; nMarks = 0; }
+  int markCount() const { return nMarks; }
+  const char *markAt(int i) const { return marks[i]; }
+  bool isMarked(const char *p) const {
+    for (int i = 0; i < nMarks; i++) if (!strcmp(marks[i], p)) return true;
+    return false;
+  }
+  void toggleMark() {
+    const Entry *e = current();
+    if (!e || !strcmp(e->path, "..")) return;
+    for (int i = 0; i < nMarks; i++)
+      if (!strcmp(marks[i], e->path)) { strcpy(marks[i], marks[--nMarks]); return; }
+    if (nMarks < cfg::MAX_MARKS) strlcpy(marks[nMarks++], e->path, sizeof marks[0]);
+  }
   void selectByPath(const char *p) {
     if (!p[0]) return;
     for (int i = 0; i < n; i++) if (!strcmp(items[i].path, p)) { sel = i; break; }
   }
 
-  // вход в выбранную папку (или ".."); false, если выбран не каталог
   bool enterSelected() {
     const Entry *e = current();
     if (!e || !e->isDir) return false;
     if (!strcmp(e->path, "..")) {
       size_t len = strlen(dir);
-      if (len > 1) dir[len - 1] = 0;  // убрать завершающий '/'
+      if (len > 1) dir[len - 1] = 0;  
       char *slash = strrchr(dir, '/');
       if (slash) slash[1] = 0;
       else strcpy(dir, "/");
@@ -647,11 +706,21 @@ class FileBrowser {
       else u8::copy(shown, sizeof shown, title, 0, WIDTH);
       snprintf(line, sizeof line, "%s%s", idx == sel ? "> " : "  ", shown);
       oled.setCursor(0, row);
-      oled.print(line);
+      if (markMode && isMarked(items[idx].path)) {  // инверсия всей строки
+        size_t l = strlen(line);
+        for (int k = u8::length(line); k < cfg::CHARS_PER_LINE && l + 1 < sizeof line; k++) line[l++] = ' ';
+        line[l] = 0;
+        oled.invertText(true);
+        oled.print(line);
+        oled.invertText(false);
+      } else oled.print(line);
     }
   }
 
  private:
+  bool markMode = false;
+  int nMarks = 0;
+  char marks[cfg::MAX_MARKS][cfg::PATH_LEN];
   enum { WIDTH = cfg::CHARS_PER_LINE - 2 };
   Entry items[cfg::MAX_FILES];
   int n = 0, sel = 0, top = 0, scrollPos = 0;
@@ -659,7 +728,7 @@ class FileBrowser {
   char dir[cfg::PATH_LEN + 2];
 
   void add(const char *path, const char *title, bool isDir, bool isImage) {
-    if (n >= cfg::MAX_FILES || strlen(path) >= sizeof items[0].path) return;  // не влезло - лучше пропустить, чем получить битый путь
+    if (n >= cfg::MAX_FILES || strlen(path) >= sizeof items[0].path) return;  
     Entry &e = items[n++];
     strlcpy(e.path, path, sizeof e.path);
     strlcpy(e.title, title, sizeof e.title);
@@ -712,7 +781,7 @@ class HtmlOut {
   }
   void end() {
     flush();
-    srv.sendContent("", 0);
+    srv.sendContent("", 0);  
   }
 
  private:
@@ -720,9 +789,39 @@ class HtmlOut {
   char buf[768];
   size_t n;
   void put(char c) { buf[n++] = c; if (n == sizeof buf) flush(); }
-  void flush() { if (n) { srv.sendContent(buf, n); n = 0; } } 
+  void flush() { if (n) { srv.sendContent(buf, n); n = 0; } }  
 };
 
+namespace gfx {
+constexpr int W = 128, H = 64, ROW_BYTES = W / 8;
+inline void toOled(const uint8_t *src, uint8_t *dst) {
+  memset(dst, 0, cfg::IMG_BYTES);
+  for (int y = 0; y < H; y++)
+    for (int x = 0; x < W; x++)
+      if ((src[y * ROW_BYTES + x / 8] >> (7 - x % 8)) & 1) dst[(y / 8) * W + x] |= (uint8_t)(1 << (y % 8));
+}
+inline void fromOled(const uint8_t *src, uint8_t *dst) {
+  memset(dst, 0, cfg::IMG_BYTES);
+  for (int y = 0; y < H; y++)
+    for (int x = 0; x < W; x++)
+      if ((src[(y / 8) * W + x] >> (y % 8)) & 1) dst[y * ROW_BYTES + x / 8] |= (uint8_t)(0x80 >> (x % 8));
+}
+inline int hexVal(char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; }
+// вытаскивает байты вида 0x3C из текста; возвращает их количество (могут быть лишние - их считаем, но не храним)
+inline size_t parseHex(const char *code, uint8_t *out, size_t cap) {
+  size_t count = 0;
+  const char *p = code;
+  while (*p) {
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+      p += 2;
+      int v = 0, d = 0;
+      while (d < 2 && isxdigit((uint8_t)*p)) { v = v * 16 + hexVal(*p); p++; d++; }
+      if (d) { if (count < cap) out[count] = (uint8_t)v; count++; }
+    } else p++;
+  }
+  return count;
+}
+}  
 
 struct WebHooks {
   virtual void filesChanged() = 0;    // файлы изменены из браузера
@@ -749,7 +848,10 @@ class WebUI {
     on("/save_lefty", HTTP_POST, &WebUI::doSaveLefty);
     on("/save_sleep", HTTP_POST, &WebUI::doSaveSleep);
     on("/save_theme", HTTP_POST, &WebUI::doSaveTheme);
-    on("/generate_204", HTTP_GET, &WebUI::redirectHome); 
+    on("/edit_img", HTTP_GET, &WebUI::pageEditImg);
+    on("/upload_img", HTTP_POST, &WebUI::doUploadImg);
+    on("/save_img", HTTP_POST, &WebUI::doSaveImg);
+    on("/generate_204", HTTP_GET, &WebUI::redirectHome);  
     on("/gen_204", HTTP_GET, &WebUI::redirectHome);
     on("/hotspot-detect.html", HTTP_GET, &WebUI::redirectHome);
     server.onNotFound([this]() { redirectHome(); });
@@ -784,12 +886,12 @@ class WebUI {
   DNSServer dns;
   IPAddress apIP;
   bool running;
+  uint8_t imgA[cfg::IMG_BYTES], imgB[cfg::IMG_BYTES];  // рабочие буферы для картинок
 
   void on(const char *uri, HTTPMethod m, void (WebUI::*h)()) {
     server.on(uri, m, [this, h]() { (this->*h)(); });
   }
 
-  // ---------- общие куски страниц
   static const Theme &theme(int i) {
     static const Theme T[9] = {
       {"#0f172a", "#1e293b", "#e2e8f0", "#38bdf8", "#334155"},
@@ -874,7 +976,6 @@ class WebUI {
     o.raw("<input type='hidden' name='"); o.raw(name); o.raw("' value='"); o.esc(value); o.raw("'>");
   }
 
-  // папка из параметра dir: проверенная и с завершающим '/'
   void argDir(char *out) {
     String d = server.hasArg("dir") ? server.arg("dir") : String("/");
     if (!str::safePath(d.c_str())) { strcpy(out, "/"); return; }
@@ -899,7 +1000,6 @@ class WebUI {
     server.send(302, "text/plain", "");
   }
 
-  // записывает файл шпаргалки: первая строка - заголовок, дальше текст
   static void writeText(const char *path, const char *title, const String &content) {
     File f = LittleFS.open(path, "w");
     if (!f) return;
@@ -917,7 +1017,6 @@ class WebUI {
     snprintf(out, cap, "%sd_%lu.txt", dir, maxId + 1);
   }
 
-  // ---------- главная страница
   void itemRow(HtmlOut &o, const char *icon, const char *title, size_t size, const char *editAction,
                const char *confirmText, const char *path, const char *dir) {
     char b[24];
@@ -960,9 +1059,14 @@ class WebUI {
     o.raw("<input type='text' name='title' placeholder='Заголовок шпаргалки' required>"
           "<textarea name='content' placeholder='Содержимое файла'></textarea>"
           "<button type='submit'>Загрузить файл</button></form></div>");
+    o.raw("<div class='card'><h3>Загрузить картинку (128x64)</h3><form method='POST' action='/upload_img'>");
+    hidden(o, "dir", dir);
+    o.raw("<input type='text' name='imgname' placeholder='Имя файла (без .h)' required>"
+          "<textarea name='imgcode' placeholder='Вставьте байты массива: 0x3C, 0x00, ... (ровно 1024 байта)'></textarea>"
+          "<button type='submit'>Загрузить картинку</button></form></div>");
     o.raw("<h3>Содержимое папки: "); o.esc(dir); o.raw("</h3>");
 
-    if (strcmp(dir, "/") != 0) {  // ссылка на родительскую папку
+    if (strcmp(dir, "/") != 0) { 
       char parent[DIR_BUF];
       strlcpy(parent, dir, sizeof parent);
       parent[strlen(parent) - 1] = 0;
@@ -972,13 +1076,16 @@ class WebUI {
     }
 
     fsx::scanDir(dir, [&](const char *p, File &f) {
-      if (!str::safePath(p)) return;  // файлы с «странными» именами через веб не трогаем
+      if (!str::safePath(p)) return;
       const char *name = str::baseName(p);
       if (f.isDirectory()) {
         o.raw("<div class='item'><div class='item-hdr'><a href='/?dir="); o.url(p); o.raw("'>&#128193; "); o.esc(name);
         o.raw("</a><form method='POST' action='/rmdir' onsubmit=\"return confirm('Удалить папку и всё её содержимое?')\" style='margin:0;'>");
         hidden(o, "dir", p);
         o.raw("<button class='del' type='submit' style='padding:4px 8px;font-size:12px;width:auto'>Удалить</button></form></div></div>");
+      }
+      else if (str::endsWith(p, ".h")) {
+        itemRow(o, "&#128444; ", name, f.size(), "/edit_img", "Удалить картинку?", p, dir);
       }
       else {
         char title[cfg::TITLE_LEN];
@@ -992,7 +1099,6 @@ class WebUI {
     o.end();
   }
 
-  // ======= редактирование текстовой шпаргалки ==========
   void pageEdit() {
     if (!server.hasArg("f")) { redirectHome(); return; }
     String fn = server.arg("f");
@@ -1094,8 +1200,88 @@ class WebUI {
     redirect(parent, ok ? "ok" : "err_rmdir");
   }
 
+  void pageEditImg() {
+    if (!server.hasArg("f")) { redirectHome(); return; }
+    String fn = server.arg("f");
+    char dir[DIR_BUF];
+    argDir(dir);
+    if (!str::safePath(fn.c_str()) || !LittleFS.exists(fn.c_str())) { redirectHome(); return; }
+    File f = LittleFS.open(fn.c_str(), "r");
+    if (!f) { redirectHome(); return; }
+    size_t n = f.read(imgA, cfg::IMG_BYTES);
+    f.close();
+    if (n < cfg::IMG_BYTES) memset(imgA + n, 0, cfg::IMG_BYTES - n);
+    gfx::fromOled(imgA, imgB);  
 
-  // ========= настройки =========
+    HtmlOut o(server);
+    head(o, "Редактирование картинки", false);
+    o.raw("<h2>Изменить: "); o.esc(str::baseName(fn.c_str()));
+    o.raw("</h2><form method='POST' action='/save_img'>");
+    hidden(o, "f", fn.c_str()); hidden(o, "dir", dir);
+    o.raw("<textarea name='imgcode' style='min-height:220px'>");
+    char h[8];
+    for (size_t i = 0; i < cfg::IMG_BYTES; i++) {
+      snprintf(h, sizeof h, "0x%02X, ", imgB[i]);
+      o.raw(h);
+      if ((i + 1) % 16 == 0) o.raw("\n");
+    }
+    o.raw("</textarea><button type='submit'>Сохранить</button></form>"
+          "<form method='POST' action='/delete' style='margin-top:10px;' onsubmit=\"return confirm('Удалить картинку?')\">");
+    hidden(o, "f", fn.c_str()); hidden(o, "dir", dir);
+    o.raw("<button class='del' type='submit'>Удалить</button></form><p style='margin-top:16px;'><a href='/?dir=");
+    o.url(dir);
+    o.raw("'>&larr; Назад</a></p></body></html>");
+    o.end();
+  }
+
+  bool parseImage(const String &code) {
+    size_t n = gfx::parseHex(code.c_str(), imgB, cfg::IMG_BYTES);
+    if (n != cfg::IMG_BYTES) return false;
+    gfx::toOled(imgB, imgA);
+    return true;
+  }
+  static void writeBin(const char *path, const uint8_t *data, size_t len) {
+    File f = LittleFS.open(path, "w");
+    if (!f) return;
+    f.write(data, len);
+    f.close();
+  }
+
+  void doUploadImg() {
+    char dir[DIR_BUF];
+    argDir(dir);
+    String raw = server.arg("imgname"), code = server.arg("imgcode");
+    char name[40];
+    size_t k = 0;
+    for (size_t i = 0; i < raw.length() && k + 1 < sizeof name; i++) { 
+      char c = raw[i];
+      if (c != '/' && c != '\\' && c != '.') name[k++] = c;
+    }
+    name[k] = 0;
+    str::trim(name);
+    if (!name[0] || strlen(name) > 30 || !str::safeChars(name)) { redirect(dir, "imgname"); return; }
+    if (!parseImage(code)) { redirect(dir, "imgsize"); return; }
+    if (!fsx::hasSpace((long)cfg::IMG_BYTES + 8)) { redirect(dir, "nospace"); return; }
+    char path[cfg::PATH_LEN * 2];
+    snprintf(path, sizeof path, "%s%s.h", dir, name);
+    if (strlen(path) >= (size_t)cfg::PATH_LEN) { redirect(dir, "toolong"); return; }
+    writeBin(path, imgA, cfg::IMG_BYTES);
+    hooks.filesChanged();
+    redirect(dir, "ok");
+  }
+
+  void doSaveImg() {
+    String fn = server.arg("f"), code = server.arg("imgcode");
+    char dir[DIR_BUF];
+    argDir(dir);
+    if (!str::safePath(fn.c_str()) || !LittleFS.exists(fn.c_str())) { redirect(dir, "empty"); return; }
+    if (!parseImage(code)) { redirect(dir, "imgsize"); return; }
+    writeBin(fn.c_str(), imgA, cfg::IMG_BYTES);
+    hooks.filesChanged();
+    redirect(dir, "ok");
+  }
+
+  // ---------- настройки
   void pageSettings() {
     static const char *const NAMES[9] = {"Синяя", "Черно/Бежевая", "Зеленая", "Фиолетовая", "Голубая",
                                          "Бирюзовая", "Бордовая", "Светлая", "Сепия/Бумага"};
@@ -1144,7 +1330,7 @@ class WebUI {
       redirectSettings("wifierr");
       return;
     }
-    strlcpy(settings.ssid, s.c_str(), sizeof settings.ssid);  // применится при следующем включении WiFi
+    strlcpy(settings.ssid, s.c_str(), sizeof settings.ssid);  
     strlcpy(settings.pass, p.c_str(), sizeof settings.pass);
     settings.touch(millis());
     redirectSettings("saved");
@@ -1172,6 +1358,116 @@ class WebUI {
   }
 };
 
+class Game {
+ public:
+  int best = 0;
+  void reset() {
+    st = READY; y = 24; vy = 0; score = 0; fr = 0; gnd = 0; last = 0;
+    for (int i = 0; i < 3; i++) { p[i].x = 150 + i * PITCH; p[i].gap = random(GMIN, GMAX + 1); p[i].passed = false; }
+  }
+  void flap() {
+    if (st == READY) { st = PLAY; vy = FLAP; }
+    else if (st == PLAY) vy = FLAP;
+    else if (st == PAUSE) st = PLAY;
+    else if (st == DEAD && millis() - deadAt > 600) reset();
+  }
+  void pause() { if (st == PLAY) st = PAUSE; else if (st == PAUSE) st = PLAY; }
+
+  bool tick(uint32_t now) {
+    if (st == PAUSE || st == DEAD || now - last < STEP_MS) return false;
+    last = now;
+    fr++;
+    if (st == READY) { y = 24 + 2.5f * sinf(fr * 0.2f); gnd += SPD; return true; }
+    vy += G; if (vy > VMAX) vy = VMAX;
+    y += vy;
+    if (y < 0) { y = 0; if (vy < 0) vy = 0; }
+    if (st == PLAY) {
+      gnd += SPD;
+      int bx0 = BX + 1, bx1 = BX + BW - 2, by0 = (int)y + 1, by1 = (int)y + BH - 2;
+      for (int i = 0; i < 3; i++) {
+        Pipe &q = p[i];
+        q.x -= SPD;
+        if (q.x + PW < 0) { q.x += 3 * PITCH; q.gap = random(GMIN, GMAX + 1); q.passed = false; }
+        int px0 = (int)q.x, px1 = px0 + PW - 1;
+        if (bx1 >= px0 && bx0 <= px1 && (by0 < q.gap || by1 >= q.gap + GAP)) st = DYING;
+        if (!q.passed && q.x + PW < BX) { q.passed = true; score++; }
+      }
+    }
+    if ((int)y + BH >= GY) { y = GY - BH; st = DEAD; deadAt = now; if (score > best) best = score; }
+    return true;
+  }
+
+  void draw(Oled &o) {
+    for (int i = 0; i < 3; i++) {
+      int x = (int)p[i].x, gt = p[i].gap, gb = p[i].gap + GAP;
+      box(o, x + 2, 0, x + PW - 3, gt - CAPH - 1, OLED_FILL);
+      box(o, x + 5, 0, x + 5, gt - CAPH - 1, OLED_CLEAR);
+      box(o, x, gt - CAPH, x + PW - 1, gt - 1, OLED_FILL);
+      box(o, x + 3, gt - CAPH + 1, x + 3, gt - 2, OLED_CLEAR);
+      box(o, x, gb, x + PW - 1, gb + CAPH - 1, OLED_FILL);
+      box(o, x + 3, gb + 1, x + 3, gb + CAPH - 2, OLED_CLEAR);
+      box(o, x + 2, gb + CAPH, x + PW - 3, GY - 1, OLED_FILL);
+      box(o, x + 5, gb + CAPH, x + 5, GY - 1, OLED_CLEAR);
+    }
+    box(o, 0, GY, 127, GY, OLED_FILL);
+    int off = (int)gnd;
+    for (int yy = GY + 2; yy < 64; yy++)
+      for (int x = 0; x < 128; x++)
+        if ((((x + off) >> 2) + ((yy - GY) >> 1)) & 1) o.dot(x, yy, 1);
+    // птичка
+    static const char *const BIRD[BH] = {
+      "...#####....", "..#.....##..", ".#......#.#.", ".#......##..",
+      ".#.....#####", ".#.....#...#", "..#.....####", "...#####...."};
+    int by = (int)y;
+    for (int r = 0; r < BH; r++)
+      for (int c = 0; c < BW; c++) o.dot(BX + c, by + r, BIRD[r][c] == '#');
+    static const uint8_t WY[4] = {1, 3, 5, 3};
+    int wy = (st == PLAY || st == READY) ? WY[(fr >> 1) & 3] : 5;
+    box(o, BX + 3, by + wy, BX + 6, by + wy + 1, OLED_FILL);
+    // счёт
+    if (st != DEAD) {
+      char b[8]; snprintf(b, sizeof b, "%d", score);
+      int w = strlen(b) * 12;
+      box(o, 0, 0, w + 3, 17, OLED_CLEAR);
+      o.setScale(2); o.setCursorXY(2, 2); o.print(b); o.setScale(1);
+    }
+    char b[24];
+    if (st == READY) {
+      box(o, 33, 36, 94, 47, OLED_CLEAR);
+      o.setCursorXY(37, 38); o.print("GET READY!");
+    } else if (st == PAUSE) {
+      box(o, 41, 28, 86, 40, OLED_CLEAR); box(o, 41, 28, 86, 40, OLED_STROKE);
+      o.setCursorXY(49, 31); o.print("PAUSE");
+    } else if (st == DEAD) {
+      box(o, 20, 8 ,105, 53, OLED_CLEAR); box(o, 20, 8, 105, 53, OLED_STROKE);
+      auto ctr = [&](int yy, const char *t){
+        o.setCursorXY((128-(int)strlen(t) * 6) / 2, yy);
+        o.print(t);
+      };
+      ctr(12, "GAME OVER");
+      box(o, 28, 22, 99, 22, OLED_FILL);
+      snprintf(b, sizeof b, "Score: %d", score); ctr(30, b);
+      snprintf(b, sizeof b, "Best: %d", best); ctr(40, b);
+    }
+  }
+
+ private:
+  enum St { READY, PLAY, PAUSE, DYING, DEAD };
+  enum { GY = 56, BX = 28, BW = 12, BH = 8, PW = 18, CAPH = 6, GAP = 26, PITCH = 64, GMIN = 12, GMAX = 22 };
+  static constexpr float G = 0.28f, FLAP = -3.2f, VMAX = 4.5f, SPD = 1.5f;
+  static constexpr uint32_t STEP_MS = 33;
+  struct Pipe { float x; int gap; bool passed; };
+  Pipe p[3];
+  St st = READY;
+  float y = 24, vy = 0, gnd = 0;
+  int score = 0, fr = 0;
+  uint32_t last = 0, deadAt = 0;
+  static void box(Oled &o, int x0, int y0, int x1, int y1, uint8_t f) {
+    if (x1 < 0 || x0 > 127 || y1 < 0 || y0 > 63 || x1 < x0 || y1 < y0) return;
+    o.rect(x0 < 0 ? 0 : x0, y0 < 0 ? 0 : y0, x1 > 127 ? 127 : x1, y1 > 63 ? 63 : y1, f);
+  }
+};
+
 class App : public WebHooks {
  public:
   App() : web(settings, files, *this) {}
@@ -1183,6 +1479,7 @@ class App : public WebHooks {
     down.begin(cfg::PIN_DOWN);
     ok.begin(cfg::PIN_OK);
     Wire.begin(cfg::PIN_SDA, cfg::PIN_SCL);
+    Wire.setClock(400000);
     oled.init();
     oled.clear();
     oled.update();
@@ -1190,8 +1487,7 @@ class App : public WebHooks {
     WiFi.mode(WIFI_OFF);
     web.setup();
     settings.load();
-    files.refresh();
-    files.selectByPath(settings.lastFile);
+    files.openAt(settings.lastFile);
     oled.setContrast(settings.brightness);
     applyOrientation();
     lastActivity = millis();
@@ -1208,7 +1504,12 @@ class App : public WebHooks {
     else if (settings.sleepEnabled && settings.sleepTimeoutMs() > 0 && now - lastActivity >= settings.sleepTimeoutMs()) enterLightSleep();
 
     handleButtons(now);
-    if (state == ST_LIST && files.tickScroll(now)) draw();
+    if (state == ST_GAME) {
+      lastActivity = now;
+      if (game.tick(now)) draw();
+      if (game.best > settings.best) { settings.best = game.best; settings.touch(now); }
+    }
+    if ((state == ST_LIST || state == ST_MARK) && files.tickScroll(now)) draw();
     settings.tick(now);
     delay(5);
   }
@@ -1219,13 +1520,14 @@ class App : public WebHooks {
   void sleepChanged() override { lastActivity = millis(); }
 
  private:
-  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC };
+  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_GAME };
 
   Oled oled;
   Settings settings;
   FileBrowser files;
   Reader reader;
   Calculator calc;
+  Game game;
   WebUI web;
   Button up, down, ok;
   State state = ST_LIST;
@@ -1233,18 +1535,71 @@ class App : public WebHooks {
   uint32_t bothSince = 0;
   bool bothHeld = false;
   bool justWoke = false;
+  bool bothDone = false;
+  int confirmSel = 1;  // 0 = Да, 1 = Нет
 
   void applyOrientation() { oled.flipH(settings.leftHanded); oled.flipV(settings.leftHanded); }
 
   void draw() {
     oled.clear();
     switch (state) {
-      case ST_LIST: files.draw(oled); break;
+      case ST_LIST: case ST_MARK: files.draw(oled); break;
+      case ST_CONFIRM: drawConfirm(); break;
+      case ST_GAME: game.draw(oled); break;
       case ST_VIEW: reader.draw(oled); break;
       case ST_WIFI: drawWifiInfo(); break;
       case ST_CALC: calc.draw(oled); break;
     }
     oled.update();
+  }
+
+  void drawConfirm() {
+    char b[40];
+    oled.setCursor(0, 0); oled.print("Все выделенные только");
+    oled.setCursor(0, 1); oled.print("что файлы вы хотите");
+    snprintf(b, sizeof b, "удалить? (%d шт.)", files.markCount());
+    oled.setCursor(0, 2); oled.print(b);
+    oled.setCursor(0, 5); oled.print(confirmSel == 0 ? "> Да" : "  Да");
+    oled.setCursor(0, 6); oled.print(confirmSel == 1 ? "> Нет" : "  Нет");
+  }
+
+  void deleteMarked() {
+    for (int i = 0; i < files.markCount(); i++) {
+      const char *p = files.markAt(i);
+      if (p[0] != '/' || !strcmp(p, "/")) continue;
+      File f = LittleFS.open(p);
+      if (!f) continue;
+      bool d = f.isDirectory();
+      f.close();
+      if (d) fsx::removeDirRecursive(p); else LittleFS.remove(p);
+    }
+    files.fixDir();
+    if (settings.lastFile[0] && !LittleFS.exists(settings.lastFile)) { settings.lastFile[0] = 0; settings.touch(millis()); }
+  }
+
+  // секретные коды калькулятора (без WiFi)
+  bool secretCode(const char *c) {
+    if (!strcmp(c, "1111")) {  // разворот экрана на 180°
+      settings.leftHanded = !settings.leftHanded;
+      applyOrientation();
+      settings.touch(millis());
+      calc.reset();
+      return true;
+    }
+    if (!strcmp(c, "0000")) {  // Flappy Bird
+      calc.reset();
+      game.best = settings.best;
+      game.reset();
+      state = ST_GAME;
+      return true;
+    }
+    if (!strcmp(c, "2222")) {  // режим удаления
+      calc.reset();
+      files.beginMark();
+      state = ST_MARK;
+      return true;
+    }
+    return false;
   }
 
   void drawWifiInfo() {
@@ -1267,7 +1622,7 @@ class App : public WebHooks {
     gpio_wakeup_enable((gpio_num_t)cfg::PIN_OK, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
     esp_light_sleep_start();
-    justWoke = true;  // первое нажатие только будит, действий не вызывает
+    justWoke = true;  
     lastActivity = millis();
     oled.setPower(true);
     draw();
@@ -1286,8 +1641,12 @@ class App : public WebHooks {
     if (anyHeld || anyPressed || up.repeat || down.repeat) lastActivity = now;
 
     if (up.stable && down.stable) {  // обе кнопки дольше 0.4 с - калькулятор
-      if (!bothHeld) { bothHeld = true; bothSince = now; }
-      else if (now - bothSince > 400 && state != ST_CALC) { calc.reset(); state = ST_CALC; draw(); }
+      if (!bothHeld) { bothHeld = true; bothDone = false; bothSince = now; }
+      else if (!bothDone && now - bothSince > 400) {
+        bothDone = true;
+        if (state == ST_MARK || state == ST_CONFIRM) { files.endMark(); state = ST_LIST; draw(); }  // выход из режима удаления
+        else if (state != ST_CALC && state != ST_GAME) { calc.reset(); state = ST_CALC; draw(); }
+      }
       return;
     }
     bothHeld = false;
@@ -1313,10 +1672,45 @@ class App : public WebHooks {
         if (downStep) changeBrightness(-15);
         if (ok.longPress) toggleWifi();
         break;
+      case ST_GAME:
+        if (navUp.pressed) { game.flap(); draw(); }
+        if (navDown.pressed) { game.pause(); draw(); }
+        if (ok.released && !ok.longFired) { state = web.active() ? ST_WIFI : ST_LIST; draw(); }
+        break;
+      case ST_MARK:
+        if (upStep) { files.move(-1); draw(); }
+        if (downStep) { files.move(1); draw(); }
+        if (ok.released && !ok.longFired) { files.toggleMark(); draw(); }  // выделить/снять
+        if (ok.longPress) {
+          const Entry *e = files.current();
+          if (e) {
+            if (e->isDir) files.enterSelected();  // зайти в папку (или ".." назад)
+            else {
+              if (!files.markCount()) files.toggleMark();
+              confirmSel = 1;
+              state = ST_CONFIRM;
+            }
+            draw();
+          }
+        }
+        break;
+      case ST_CONFIRM:
+        if (upStep || downStep) { confirmSel ^= 1; draw(); }
+        if (ok.released && !ok.longFired) {
+          if (confirmSel == 0) deleteMarked();
+          files.endMark();
+          state = ST_LIST;
+          rememberSelection();
+          draw();
+        }
+        break;
       case ST_CALC:
         if (upStep) { calc.moveSel(-1); draw(); }
         if (downStep) { calc.moveSel(1); draw(); }
-        if (ok.released && !ok.longFired) { calc.pressSelected(); draw(); }
+        if (ok.released && !ok.longFired) {
+          if (!(!strcmp(calc.selectedKey(), "=") && secretCode(calc.text()))) calc.pressSelected();
+          draw();
+        }
         if (ok.longPress) { state = web.active() ? ST_WIFI : ST_LIST; draw(); }
         break;
     }
@@ -1326,6 +1720,8 @@ class App : public WebHooks {
     const Entry *e = files.current();
     if (!e) return;
     if (e->isDir) { files.enterSelected(); draw(); return; }
+    if (e->isImage) reader.openImage(e->path);
+    else
       reader.openText(e->path);
     state = ST_VIEW;
     rememberSelection();
@@ -1347,7 +1743,7 @@ class App : public WebHooks {
   }
 };
 
-static App app;
+static App app;  
 
 void setup() { app.begin(); }
 void loop() { app.loop(); }
