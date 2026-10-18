@@ -158,3 +158,35 @@ firmware: 10000
 (GREBER прикреплен)
 
 ![](PCB/plata.png)
+
+### Структура репозитория:
+```text
+Supermini-Reader/
+├── Code/
+│   ├── scr/
+|   |    └── main.cpp   <- исходный код 
+│   ├── no_ota.cs
+│   └── platform.ini
+|
+├── PCB/
+|   ├── Supermini-Reader-v1.zip
+|   └── plata.png
+|
+├── bin/
+|   ├── bootloader.bin
+|   ├── firmware.bin
+|   └── partitions.bin
+|
+├── photo/
+|   ├── photo2.png
+|   ├── photo3.png
+|   ├── photo4.png
+|   └── photo5.png
+|
+├── ЛУТ/PDF/
+|   ├── plata-niz.pdf
+|   └── plata-verx.pdf
+|
+├── LICENSE
+└── README.md
+```
