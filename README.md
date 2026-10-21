@@ -122,7 +122,7 @@ String AP_PASS = "12345678";
 
 (ниже для ESP32-S3 Supermini)
 
-![](photo/photo4.png)
+![](photo/photo4.jpg)
 
 ---
 
