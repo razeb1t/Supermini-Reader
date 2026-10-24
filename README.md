@@ -3,7 +3,7 @@
 <p align="center">
   <img alt="ESP32-S3" src="https://img.shields.io/badge/MCU-ESP32--S3--Supermini-00979D?logo=espressif&logoColor=white" />
   <img alt="OLED" src="https://img.shields.io/badge/Display-SSD1306%20128x64-5B8CFF" />
-  <img alt="IR" src="https://img.shields.io/badge/Works%20with-English%20%7C%20Russian-FF5C5C" />
+  <img alt="IR" src="https://img.shields.io/badge/Support-English%20%7C%20Russian-FF5C5C" />
   <img alt="Storage" src="https://img.shields.io/badge/Memory-2,5MB-F39C12" />
   <img alt="Expansion" src="https://img.shields.io/badge/Expansion-Calcluator%20%7C%20Web--Interface-7B61FF" />
   <img alt="Code" src="https://img.shields.io/badge/Code-Open%20source-00D2BB" />
