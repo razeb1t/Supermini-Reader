@@ -114,7 +114,7 @@ template <class Fn> void scanDir(const char *dir, Fn fn) {
   while (f) {
     const char *p = f.path();
     if (!p || !*p) { snprintf(tmp, sizeof tmp, "%s%s", dir, f.name()); p = tmp; }
-    if (!strstr(p, cfg::SETTINGS_PATH + 1)) fn(p, f);
+    if (!strstr(p, cfg::SETTINGS_PATH + 1) && !strstr(p, "_up.tmp")) fn(p, f);
     f = root.openNextFile();
   }
 }
@@ -191,8 +191,9 @@ class Settings {
   bool leftHanded = false;
   bool sleepEnabled = false;
   int sleepMin = 0, sleepSec = 0;
-  int webTheme = 0;
+  int webTheme = 1;
   int best = 0;  // рекорд Flappy Bird
+  int promptCs = 100;  // суфлёр: секунд на строку, в сотых (100 = 1.00 с)
   char ssid[33];
   char pass[65];
   char lastFile[cfg::PATH_LEN];
@@ -213,9 +214,9 @@ class Settings {
     if (!LittleFS.exists(cfg::SETTINGS_PATH)) return;
     File f = LittleFS.open(cfg::SETTINGS_PATH, "r");
     if (!f) return;
-    char l[10][cfg::PATH_LEN];
+    char l[11][cfg::PATH_LEN];
     int got = 0;
-    while (got < 10 && f.available()) {
+    while (got < 11 && f.available()) {
       fsx::readLine(f, l[got], cfg::PATH_LEN);
       str::trim(l[got]);
       got++;
@@ -231,6 +232,7 @@ class Settings {
     if (got > 7 && l[7][0]) sleepEnabled = atoi(l[7]) == 1;
     if (got > 8 && l[8][0]) webTheme = constrain(atoi(l[8]), 0, 8);
     if (got > 9 && l[9][0]) best = constrain(atoi(l[9]), 0, 99999);
+    if (got > 10 && l[10][0]) promptCs = constrain(atoi(l[10]), 5, 6000);
   }
   void save() const {
     File f = LittleFS.open(cfg::SETTINGS_PATH, "w");
@@ -245,6 +247,7 @@ class Settings {
     f.println(sleepEnabled ? 1 : 0);
     f.println(webTheme);
     f.println(best);
+    f.println(promptCs);
     f.close();
   }
 
@@ -439,7 +442,7 @@ class LineReader {
         have = true;
       }
       if (!started) { if (startOff) *startOff = wstart; started = true; }
-      if (wchars == 0) { have = false; return true; }  // пустая строка в тексте
+      if (wchars == 0) { have = false; if (wbreak) return true; continue; }  // пустая строка в тексте / слово целиком выброшено
       int extra = (lc > 0 ? 1 : 0) + wchars;
       if (lc + extra > cfg::CHARS_PER_LINE) return true;  // слово переносится на следующую строку
       if (lc > 0 && lb + 1 < cap) line[lb++] = ' ';
@@ -492,7 +495,50 @@ class LineReader {
       if (c == -1) break;
     }
     word[wbytes] = 0;
+    normalize();
     return true;
+  }
+
+  // Убирает из слова всё, чего нет в шрифте OLED (даёт '?'): битый UTF-8, управляющие,
+  // невидимые и типографские символы заменяются на ASCII-аналоги.
+  void normalize() {
+    char out[sizeof word];
+    int o = 0;
+    for (int i = 0; i < wbytes;) {
+      uint8_t c = (uint8_t)word[i];
+      if (c < 0x20 || c == 0x7F) { i++; continue; }
+      if (c < 0x80) { out[o++] = (char)c; i++; continue; }
+      int need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 0;
+      bool ok = need && i + need <= wbytes;
+      for (int k = 1; ok && k < need; k++) ok = u8::isCont((uint8_t)word[i + k]);
+      if (!ok) { i++; continue; }  // оборванный/битый символ — выкидываем
+      uint8_t b1 = (uint8_t)word[i + 1], b2 = need > 2 ? (uint8_t)word[i + 2] : 0;
+      const char *rep = nullptr;
+      bool known = false;
+      if (c == 0xC2 && b1 == 0xA0) { rep = " "; known = true; }
+      else if (c == 0xC2 && (b1 == 0xAB || b1 == 0xBB)) { rep = "\""; known = true; }
+      else if (c == 0xC2 && b1 == 0xAD) { rep = ""; known = true; }
+      else if (c == 0xE2 && b1 == 0x80) {
+        known = true;
+        if (b2 >= 0x80 && b2 <= 0x8F) rep = "";            // zero-width и пр.
+        else if (b2 >= 0x90 && b2 <= 0x95) rep = "-";
+        else if (b2 == 0x98 || b2 == 0x99 || b2 == 0x9A) rep = "'";
+        else if (b2 == 0x9C || b2 == 0x9D || b2 == 0x9E) rep = "\"";
+        else if (b2 == 0xA6) rep = "...";
+        else if (b2 == 0xA2) rep = "*";
+        else known = false;
+      }
+      else if (c == 0xEF && b1 == 0xBB && b2 == 0xBF) { rep = ""; known = true; }  // BOM
+      if (known) { for (const char *r = rep; *r && o < (int)sizeof out - 1; r++) out[o++] = *r; }
+      else if (need == 2 && (c == 0xD0 || c == 0xD1) && o + 2 < (int)sizeof out) { out[o++] = (char)c; out[o++] = (char)b1; }
+      else if (need >= 3) { /* прочие 3-4-байтные (эмодзи и т.п.) — не отображаются */ }
+      else if (o + 2 < (int)sizeof out) { out[o++] = (char)c; out[o++] = (char)b1; }
+      i += need;
+    }
+    memcpy(word, out, o);
+    word[o] = 0;
+    wbytes = o;
+    wchars = u8::length(word);
   }
 };
 
@@ -532,7 +578,20 @@ class Reader {
     page--;
     return true;
   }
+
+  // ---- суфлёр: построчная прокрутка с первой страницы; страница и её смещения не меняются,
+  // поэтому после выхода экран выглядит ровно как до запуска
+  bool canPrompt() const { return !isImage && page == 0; }
+  void promptStart() { prompting = true; promptMore = false; promptOff = pageOff[0]; }
+  void promptStop() { prompting = false; }
+  bool promptAdvance() {  // false = текст закончился
+    if (!promptMore) return false;
+    promptOff = promptNext;
+    return true;
+  }
+
   void draw(Oled &oled) {
+    if (prompting && !isImage) { drawPrompt(oled); return; }
     if (isImage) {
       if (!imgOk) { msg(oled, "Ошибка чтения"); return; }
       oled.drawBitmap(0, 0, img, 128, 64);
@@ -562,6 +621,25 @@ class Reader {
   int page = 0;
   bool hasNext = false;
   uint32_t nextOff = 0;
+  bool prompting = false, promptMore = false;
+  uint32_t promptOff = 0, promptNext = 0;
+  void drawPrompt(Oled &oled) {
+    promptMore = false;
+    File f = LittleFS.open(file, "r");
+    if (!f) { msg(oled, "Ошибка чтения"); return; }
+    LineReader lr;
+    lr.begin(f, promptOff);
+    char line[cfg::CHARS_PER_LINE * 4 + 1];
+    uint32_t off = 0;
+    int rows = 0;
+    for (; rows < cfg::SCREEN_ROWS; rows++) {
+      if (!lr.nextLine(line, sizeof line, rows == 1 ? &off : nullptr)) break;
+      oled.setCursor(0, rows);
+      oled.print(line);
+    }
+    f.close();
+    if (rows >= 2) { promptMore = true; promptNext = off; }  // есть вторая строка — можно сдвинуться
+  }
   uint32_t pageOff[cfg::MAX_PAGES];  // начало каждой посещённой страницы
   bool imgOk = false;
   uint8_t img[cfg::IMG_BYTES];
@@ -812,7 +890,10 @@ inline size_t parseHex(const char *code, uint8_t *out, size_t cap) {
   size_t count = 0;
   const char *p = code;
   while (*p) {
-    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+    if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') p++; continue; }        // комментарий //
+    if (p[0] == '/' && p[1] == '*') { p += 2; while (*p && !(p[0] == '*' && p[1] == '/')) p++; if (*p) p += 2; continue; }  // /* */
+    bool prevWord = p > code && isalnum((uint8_t)p[-1]);  // "1280x640" не считаем байтом
+    if (!prevWord && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
       p += 2;
       int v = 0, d = 0;
       while (d < 2 && isxdigit((uint8_t)*p)) { v = v * 16 + hexVal(*p); p++; d++; }
@@ -839,14 +920,15 @@ class WebUI {
     on("/", HTTP_GET, &WebUI::pageRoot);
     on("/settings", HTTP_GET, &WebUI::pageSettings);
     on("/edit", HTTP_GET, &WebUI::pageEdit);
-    on("/upload", HTTP_POST, &WebUI::doUpload);
+    server.on("/upload", HTTP_POST, [this]() { doUpload(); }, [this]() { uploadChunk(); });
     on("/mkdir", HTTP_POST, &WebUI::doMkdir);
     on("/rmdir", HTTP_POST, &WebUI::doRmdir);
-    on("/save", HTTP_POST, &WebUI::doSave);
+    server.on("/save", HTTP_POST, [this]() { doSave(); }, [this]() { uploadChunk(); });
     on("/delete", HTTP_POST, &WebUI::doDelete);
     on("/save_wifi", HTTP_POST, &WebUI::doSaveWifi);
     on("/save_lefty", HTTP_POST, &WebUI::doSaveLefty);
     on("/save_sleep", HTTP_POST, &WebUI::doSaveSleep);
+    on("/save_prompt", HTTP_POST, &WebUI::doSavePrompt);
     on("/save_theme", HTTP_POST, &WebUI::doSaveTheme);
     on("/edit_img", HTTP_GET, &WebUI::pageEditImg);
     on("/upload_img", HTTP_POST, &WebUI::doUploadImg);
@@ -861,6 +943,7 @@ class WebUI {
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
     WiFi.softAP(settings.ssid, settings.pass[0] ? settings.pass : nullptr);
     dns.start(53, "*", apIP);
+    LittleFS.remove(TMP);
     server.begin();
     running = true;
   }
@@ -1054,15 +1137,27 @@ class WebUI {
     hidden(o, "dir", dir);
     o.raw("<input type='text' name='dirname' placeholder='Имя папки' required><button type='submit'>Создать</button></form></div>");
 
-    o.raw("<div class='card'><h3>Добавить шпаргалку</h3><form method='POST' action='/upload'>");
+    o.raw("<div class='card'><h3>Добавить шпаргалку</h3><script>function sendTxt(f){var d=new FormData();['dir','f','title'].forEach(function(n){var e=f.elements[n];if(e)d.append(n,e.value)});var bl=new Blob([f.elements['content'].value],{type:'text/plain'});d.append('len',bl.size);d.append('content',bl,'c.txt');var b=f.querySelector('button[type=submit]');b.disabled=true;fetch(f.action,{method:'POST',body:d}).then(function(r){location.href=r.url}).catch(function(){b.disabled=false;alert('Ошибка загрузки')});return false}</script><form method='POST' action='/upload' enctype='multipart/form-data' onsubmit=\"return sendTxt(this)\">");
     hidden(o, "dir", dir);
     o.raw("<input type='text' name='title' placeholder='Заголовок шпаргалки' required>"
           "<textarea name='content' placeholder='Содержимое файла'></textarea>"
           "<button type='submit'>Загрузить файл</button></form></div>");
     o.raw("<div class='card'><h3>Загрузить картинку (128x64)</h3><form method='POST' action='/upload_img'>");
     hidden(o, "dir", dir);
+    o.raw(R"JS(<label style='display:block;padding:14px;border:2px dashed var(--acc);border-radius:10px;text-align:center;color:var(--acc);font-weight:600;cursor:pointer;margin:6px 0 12px'><span id='pn'>&#128444; Выбрать картинку</span><input type='file' id='pf' accept='image/*' hidden></label>
+<label style='display:flex;align-items:center;gap:10px;font-size:13px;margin-bottom:10px'>Порог<input type='range' id='pt' min='1' max='254' value='128' style='flex:1;width:auto;margin:0;padding:0;border:0;background:none;accent-color:var(--acc)'></label>
+<label style='display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px'><input type='checkbox' id='pi' style='width:auto;margin:0;accent-color:var(--acc)'>Инвертировать</label>
+<canvas id='pc' width='128' height='64' style='width:100%;image-rendering:pixelated;background:#000;border-radius:8px;display:none;margin-bottom:8px'></canvas>
+<script>(function(){var f=document.currentScript.parentNode,fi=f.querySelector('#pf'),th=f.querySelector('#pt'),iv=f.querySelector('#pi'),c=f.querySelector('#pc'),x=c.getContext('2d',{willReadFrequently:true}),im=null;
+function go(){if(!im)return;x.fillStyle='#000';x.fillRect(0,0,128,64);var s=Math.min(128/im.width,64/im.height),w=im.width*s,h=im.height*s;var ox=(128-w)/2,oy=(64-h)/2;x.imageSmoothingQuality='high';x.drawImage(im,ox,oy,w,h);var q=x.getImageData(Math.ceil(ox),Math.ceil(oy),1,1).data;x.fillStyle='rgb('+q[0]+','+q[1]+','+q[2]+')';x.fillRect(0,0,128,64);x.drawImage(im,ox,oy,w,h);
+var g=x.getImageData(0,0,128,64),d=g.data,o=[],t=+th.value,v=iv.checked;
+for(var y=0;y<64;y++)for(var b=0;b<16;b++){var n=0;for(var k=0;k<8;k++){var i=(y*128+b*8+k)*4,on=(d[i]*.299+d[i+1]*.587+d[i+2]*.114)>t;if(on!=v)n|=128>>k;d[i]=d[i+1]=d[i+2]=(on!=v)?255:0;d[i+3]=255}o.push('0x'+(n+256).toString(16).slice(1).toUpperCase())}
+x.putImageData(g,0,0);c.style.display='block';f.imgcode.value=o.join(', ')}
+fi.onchange=function(){var r=fi.files[0];if(!r)return;f.querySelector('#pn').textContent=r.name;if(!f.imgname.value)f.imgname.value=r.name.replace(/\.[^.]*$/,'').replace(/[^\w-]/g,'_').slice(0,30);
+var u=URL.createObjectURL(r),i=new Image();i.onload=function(){im=i;go();URL.revokeObjectURL(u)};i.onerror=function(){im=null;f.imgcode.value='';alert('Не удалось открыть картинку');URL.revokeObjectURL(u)};i.src=u};
+th.oninput=iv.onchange=go})();</script>)JS");
     o.raw("<input type='text' name='imgname' placeholder='Имя файла (без .h)' required>"
-          "<textarea name='imgcode' placeholder='Вставьте байты массива: 0x3C, 0x00, ... (ровно 1024 байта)'></textarea>"
+          "<textarea name='imgcode' placeholder='Выберите картинку выше или вставьте байты: 0x3C, 0x00, ... (ровно 1024 байта)' required></textarea>"
           "<button type='submit'>Загрузить картинку</button></form></div>");
     o.raw("<h3>Содержимое папки: "); o.esc(dir); o.raw("</h3>");
 
@@ -1113,7 +1208,7 @@ class WebUI {
 
     HtmlOut o(server);
     head(o, "Редактирование", false);
-    o.raw("<h2>Изменить шпаргалку</h2><form method='POST' action='/save'>");
+    o.raw("<h2>Изменить шпаргалку</h2><script>function sendTxt(f){var d=new FormData();['dir','f','title'].forEach(function(n){var e=f.elements[n];if(e)d.append(n,e.value)});var bl=new Blob([f.elements['content'].value],{type:'text/plain'});d.append('len',bl.size);d.append('content',bl,'c.txt');var b=f.querySelector('button[type=submit]');b.disabled=true;fetch(f.action,{method:'POST',body:d}).then(function(r){location.href=r.url}).catch(function(){b.disabled=false;alert('Ошибка загрузки')});return false}</script><form method='POST' action='/save' enctype='multipart/form-data' onsubmit=\"return sendTxt(this)\">");
     hidden(o, "f", fn.c_str()); hidden(o, "dir", dir);
     o.raw("<input type='text' name='title' value='"); o.esc(title);
     o.raw("' required><textarea name='content'>");
@@ -1130,36 +1225,81 @@ class WebUI {
     o.end();
   }
 
+  // Потоковая приём текста: содержимое пишется прямо в файл кусками, без больших String в памяти
+  static constexpr const char *TMP = "/_up.tmp";
+  File upFile;
+  bool upErr = false;
+  size_t upBytes = 0;
+
+  void uploadChunk() {
+    HTTPUpload &u = server.upload();
+    if (u.status == UPLOAD_FILE_START) {
+      if (upFile) upFile.close();
+      upErr = false;
+      upBytes = 0;
+      upFile = LittleFS.open(TMP, "w");
+      if (!upFile) { upErr = true; return; }
+      String t = server.arg("title");
+      t.trim();
+      for (size_t i = 0; i < t.length(); i++) {
+        char c = t[i];
+        if (upFile.write((uint8_t)(c == '\n' || c == '\r' ? ' ' : c)) != 1) upErr = true;
+      }
+      if (upFile.write((uint8_t)'\n') != 1) upErr = true;
+    } else if (u.status == UPLOAD_FILE_WRITE) {
+      upBytes += u.currentSize;
+      if (upFile && !upErr && upFile.write(u.buf, u.currentSize) != u.currentSize) upErr = true;
+    } else if (u.status == UPLOAD_FILE_END) {
+      if (upFile) upFile.close();
+    } else if (u.status == UPLOAD_FILE_ABORTED) {
+      upErr = true;
+      if (upFile) upFile.close();
+    }
+  }
+
+  // Приём не стартовал (пустое содержимое) — создаём временный файл только с заголовком
+  bool ensureTmp(const String &title) {
+    if (LittleFS.exists(TMP)) return true;
+    File f = LittleFS.open(TMP, "w");
+    if (!f) return false;
+    for (size_t i = 0; i < title.length(); i++) f.write((uint8_t)(title[i] == '\n' || title[i] == '\r' ? ' ' : title[i]));
+    f.write((uint8_t)'\n');
+    f.close();
+    return true;
+  }
+
   void doUpload() {
     char dir[DIR_BUF];
     argDir(dir);
     String title = server.arg("title");
     title.trim();
-    String content = server.arg("content");
-    if (!title.length()) { redirect(dir, "empty"); return; }
-    if (!fsx::hasSpace((long)(title.length() + content.length() + 8))) { redirect(dir, "nospace"); return; }
+    if (!title.length()) { LittleFS.remove(TMP); redirect(dir, "empty"); return; }
+    if (upFile) upFile.close();
+    if (upErr || (size_t)server.arg("len").toInt() != upBytes || !ensureTmp(title)) { LittleFS.remove(TMP); upErr = false; upBytes = 0; redirect(dir, "nospace"); return; }
+    upBytes = 0;
     char path[cfg::PATH_LEN * 2];
     newFileName(dir, path, sizeof path);
-    if (strlen(path) >= (size_t)cfg::PATH_LEN) { redirect(dir, "toolong"); return; }
-    writeText(path, title.c_str(), content);
+    if (strlen(path) >= (size_t)cfg::PATH_LEN) { LittleFS.remove(TMP); redirect(dir, "toolong"); return; }
+    bool ok = LittleFS.rename(TMP, path);
+    if (!ok) LittleFS.remove(TMP);
     hooks.filesChanged();
-    redirect(dir, "ok");
+    redirect(dir, ok ? "ok" : "nospace");
   }
 
   void doSave() {
-    String fn = server.arg("f"), title = server.arg("title"), content = server.arg("content");
+    String fn = server.arg("f"), title = server.arg("title");
     char dir[DIR_BUF];
     argDir(dir);
     title.trim();
-    if (!title.length() || !str::safePath(fn.c_str()) || !LittleFS.exists(fn.c_str())) { redirect(dir, "empty"); return; }
-    size_t oldSize = 0;
-    File f = LittleFS.open(fn.c_str(), "r");
-    if (f) { oldSize = f.size(); f.close(); }
-    long delta = (long)(title.length() + content.length() + 2) - (long)oldSize;
-    if (delta > 0 && !fsx::hasSpace(delta)) { redirect(dir, "nospace"); return; }
-    writeText(fn.c_str(), title.c_str(), content);
+    if (upFile) upFile.close();
+    if (!title.length() || !str::safePath(fn.c_str()) || !LittleFS.exists(fn.c_str())) { LittleFS.remove(TMP); redirect(dir, "empty"); return; }
+    if (upErr || (size_t)server.arg("len").toInt() != upBytes || !ensureTmp(title)) { LittleFS.remove(TMP); upErr = false; upBytes = 0; redirect(dir, "nospace"); return; }
+    upBytes = 0;
+    LittleFS.remove(fn.c_str());
+    bool ok = LittleFS.rename(TMP, fn.c_str());
+    if (!ok) LittleFS.remove(TMP);
     hooks.filesChanged();
-    redirect(dir, "ok");
+    redirect(dir, ok ? "ok" : "nospace");
   }
 
   void doDelete() {
@@ -1240,11 +1380,16 @@ class WebUI {
     gfx::toOled(imgB, imgA);
     return true;
   }
-  static void writeBin(const char *path, const uint8_t *data, size_t len) {
-    File f = LittleFS.open(path, "w");
-    if (!f) return;
-    f.write(data, len);
+  // Пишет через временный файл: при ошибке записи старая картинка остаётся целой
+  static bool writeBin(const char *path, const uint8_t *data, size_t len) {
+    const char *tmp = "/_up.tmp";
+    File f = LittleFS.open(tmp, "w");
+    if (!f) return false;
+    bool ok = f.write(data, len) == len;
     f.close();
+    if (ok) { LittleFS.remove(path); ok = LittleFS.rename(tmp, path); }
+    if (!ok) LittleFS.remove(tmp);
+    return ok;
   }
 
   void doUploadImg() {
@@ -1264,10 +1409,12 @@ class WebUI {
     if (!fsx::hasSpace((long)cfg::IMG_BYTES + 8)) { redirect(dir, "nospace"); return; }
     char path[cfg::PATH_LEN * 2];
     snprintf(path, sizeof path, "%s%s.h", dir, name);
+    for (int n = 2; LittleFS.exists(path) && n < 1000; n++) snprintf(path, sizeof path, "%s%s_%d.h", dir, name, n);  // не затираем чужую картинку
+    if (LittleFS.exists(path)) { redirect(dir, "imgname"); return; }
     if (strlen(path) >= (size_t)cfg::PATH_LEN) { redirect(dir, "toolong"); return; }
-    writeBin(path, imgA, cfg::IMG_BYTES);
+    bool ok = writeBin(path, imgA, cfg::IMG_BYTES);
     hooks.filesChanged();
-    redirect(dir, "ok");
+    redirect(dir, ok ? "ok" : "nospace");
   }
 
   void doSaveImg() {
@@ -1276,9 +1423,9 @@ class WebUI {
     argDir(dir);
     if (!str::safePath(fn.c_str()) || !LittleFS.exists(fn.c_str())) { redirect(dir, "empty"); return; }
     if (!parseImage(code)) { redirect(dir, "imgsize"); return; }
-    writeBin(fn.c_str(), imgA, cfg::IMG_BYTES);
+    bool ok = writeBin(fn.c_str(), imgA, cfg::IMG_BYTES);
     hooks.filesChanged();
-    redirect(dir, "ok");
+    redirect(dir, ok ? "ok" : "nospace");
   }
 
   // ---------- настройки
@@ -1319,7 +1466,14 @@ class WebUI {
     o.raw("'></div><div><label class='hint'>Секунды</label>"
           "<input type='number' name='sec' min='0' max='59' value='");
     o.num(settings.sleepSec);
-    o.raw("'></div></div><button type='submit'>Сохранить</button></form></div></body></html>");
+    o.raw("'></div></div><button type='submit'>Сохранить</button></form></div>");
+
+    o.raw("<div class='card'><h3>Суфлёр</h3><form method='POST' action='/save_prompt'>"
+          "<label class='hint'>Секунд на строку (от 0.05 до 60, шаг 0.01)</label>"
+          "<input type='number' name='speed' min='0.05' max='60' step='0.01' value='");
+    snprintf(b, sizeof b, "%d.%02d", settings.promptCs / 100, settings.promptCs % 100);
+    o.raw(b);
+    o.raw("'><button type='submit'>Сохранить</button></form></div></body></html>");
     o.end();
   }
 
@@ -1347,6 +1501,16 @@ class WebUI {
     settings.sleepSec = constrain((int)server.arg("sec").toInt(), 0, 59);
     settings.touch(millis());
     hooks.sleepChanged();
+    redirectSettings("saved");
+  }
+  void doSavePrompt() {
+    String v = server.arg("speed");
+    v.replace(',', '.');
+    float sec = v.toFloat();
+    if (!(sec >= 0.05f)) sec = 0.05f;  // заодно ловит NaN и пустое значение
+    if (sec > 60.0f) sec = 60.0f;
+    settings.promptCs = constrain((int)lroundf(sec * 100.0f), 5, 6000);
+    settings.touch(millis());
     redirectSettings("saved");
   }
   void doSaveTheme() {
@@ -1509,6 +1673,13 @@ class App : public WebHooks {
       if (game.tick(now)) draw();
       if (game.best > settings.best) { settings.best = game.best; settings.touch(now); }
     }
+    if (state == ST_PROMPT) {
+      lastActivity = now;  // во время суфлёра не засыпаем
+      if (!promptPaused && now - promptLast >= (uint32_t)settings.promptCs * 10UL) {
+        promptLast = now;
+        if (!reader.promptAdvance()) exitPrompt(); else draw();
+      }
+    }
     if ((state == ST_LIST || state == ST_MARK) && files.tickScroll(now)) draw();
     settings.tick(now);
     delay(5);
@@ -1520,7 +1691,7 @@ class App : public WebHooks {
   void sleepChanged() override { lastActivity = millis(); }
 
  private:
-  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_GAME };
+  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_GAME, ST_PROMPT };
 
   Oled oled;
   Settings settings;
@@ -1532,6 +1703,8 @@ class App : public WebHooks {
   Button up, down, ok;
   State state = ST_LIST;
   uint32_t lastActivity = 0;
+  bool promptPaused = false, promptArm = false;
+  uint32_t promptLast = 0;
   uint32_t bothSince = 0;
   bool bothHeld = false;
   bool justWoke = false;
@@ -1546,7 +1719,7 @@ class App : public WebHooks {
       case ST_LIST: case ST_MARK: files.draw(oled); break;
       case ST_CONFIRM: drawConfirm(); break;
       case ST_GAME: game.draw(oled); break;
-      case ST_VIEW: reader.draw(oled); break;
+      case ST_VIEW: case ST_PROMPT: reader.draw(oled); break;
       case ST_WIFI: drawWifiInfo(); break;
       case ST_CALC: calc.draw(oled); break;
     }
@@ -1645,7 +1818,7 @@ class App : public WebHooks {
       else if (!bothDone && now - bothSince > 400) {
         bothDone = true;
         if (state == ST_MARK || state == ST_CONFIRM) { files.endMark(); state = ST_LIST; draw(); }  // выход из режима удаления
-        else if (state != ST_CALC && state != ST_GAME) { calc.reset(); state = ST_CALC; draw(); }
+        else if (state != ST_CALC && state != ST_GAME && state != ST_PROMPT) { calc.reset(); state = ST_CALC; draw(); }
       }
       return;
     }
@@ -1663,9 +1836,27 @@ class App : public WebHooks {
         if (ok.longPress) toggleWifi();
         break;
       case ST_VIEW:
+        if (navUp.pressed) promptArm = reader.canPrompt();  // нажатие НАЧАЛОСЬ на первой странице?
+        if (navUp.longPress && promptArm) {  // ▲ зажата на первой странице — запуск суфлёра
+          promptArm = false;
+          reader.promptStart();
+          state = ST_PROMPT;
+          promptPaused = false;
+          promptLast = now;
+          draw();
+          break;
+        }
         if (upStep && reader.prev()) draw();
         if (downStep && reader.next()) draw();
         if (ok.released && !ok.longFired) { state = ST_LIST; draw(); }
+        break;
+      case ST_PROMPT:
+        if (navUp.pressed) { promptPaused = !promptPaused; promptLast = now; }  // пауза / продолжить
+        if (downStep) {  // ▼ — вручную на строку вниз (авто-прокрутка встаёт на паузу)
+          promptPaused = true;
+          if (!reader.promptAdvance()) exitPrompt(); else draw();
+        }
+        if (ok.released && !ok.longFired) exitPrompt();
         break;
       case ST_WIFI:
         if (upStep) changeBrightness(15);
@@ -1714,6 +1905,12 @@ class App : public WebHooks {
         if (ok.longPress) { state = web.active() ? ST_WIFI : ST_LIST; draw(); }
         break;
     }
+  }
+
+  void exitPrompt() {
+    reader.promptStop();
+    state = ST_VIEW;  // страница та же, что была до суфлёра
+    draw();
   }
 
   void openSelected() {
