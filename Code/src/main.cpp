@@ -4,6 +4,10 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <esp_system.h>
+#if __has_include(<esp_random.h>)
+#include <esp_random.h>
+#endif
 #include <LittleFS.h>
 #include <algorithm>
 #include <esp_sleep.h>
@@ -191,8 +195,9 @@ class Settings {
   bool leftHanded = false;
   bool sleepEnabled = false;
   int sleepMin = 0, sleepSec = 0;
-  int webTheme = 1;
+  int webTheme = 0;
   int best = 0;  // рекорд Flappy Bird
+  int tetBest = 0;  // рекорд Tetris
   int promptCs = 100;  // суфлёр: секунд на строку, в сотых (100 = 1.00 с)
   char ssid[33];
   char pass[65];
@@ -214,9 +219,9 @@ class Settings {
     if (!LittleFS.exists(cfg::SETTINGS_PATH)) return;
     File f = LittleFS.open(cfg::SETTINGS_PATH, "r");
     if (!f) return;
-    char l[11][cfg::PATH_LEN];
+    char l[12][cfg::PATH_LEN];
     int got = 0;
-    while (got < 11 && f.available()) {
+    while (got < 12 && f.available()) {
       fsx::readLine(f, l[got], cfg::PATH_LEN);
       str::trim(l[got]);
       got++;
@@ -233,6 +238,7 @@ class Settings {
     if (got > 8 && l[8][0]) webTheme = constrain(atoi(l[8]), 0, 8);
     if (got > 9 && l[9][0]) best = constrain(atoi(l[9]), 0, 99999);
     if (got > 10 && l[10][0]) promptCs = constrain(atoi(l[10]), 5, 6000);
+    if (got > 11 && l[11][0]) tetBest = constrain(atoi(l[11]), 0, 999999);
   }
   void save() const {
     File f = LittleFS.open(cfg::SETTINGS_PATH, "w");
@@ -248,6 +254,7 @@ class Settings {
     f.println(webTheme);
     f.println(best);
     f.println(promptCs);
+    f.println(tetBest);
     f.close();
   }
 
@@ -301,35 +308,42 @@ class Calculator {
   }
 
   void draw(Oled &oled) const {
+    // Только оформление. Масштаб 1, весь текст на границах страниц (8 px) - так GyverOLED рисует чисто.
+    // Дисплей: рамка, ввод или результат слева направо
     char line[32];
     if (result[0]) snprintf(line, sizeof line, "=%s", result);
     else strlcpy(line, disp, sizeof line);
     int len = u8::length(line);
-    if (len > 22) { char t[32]; u8::copy(t, sizeof t, line, len - 21, 21); strlcpy(line, t, sizeof line); }
-    oled.setCursor(0, 0);
+    if (len > 19) { char t[32]; u8::copy(t, sizeof t, line, len - 19, 19); strlcpy(line, t, sizeof line); len = 19; }
+    // Скруглённая рамка из сплошных линий (углы - короткие диагонали, без отдельных точек)
+    oled.line(2, 1, 125, 1);   oled.line(2, 21, 125, 21);
+    oled.line(0, 3, 0, 19);    oled.line(127, 3, 127, 19);
+    oled.line(0, 3, 2, 1);     oled.line(125, 1, 127, 3);
+    oled.line(0, 19, 2, 21);   oled.line(125, 21, 127, 19);
+    oled.setCursor(5, 1);
     oled.print(line);
-    oled.line(0, 20, 127, 20);
+    if (!result[0]) oled.line(5 + len * 6, 8, 5 + len * 6, 14);  // курсор ввода
 
     const int BTN_W = 32, CHAR_W = 6, CHAR_H = 8, BTN_CHARS = 5, FIRST_ROW = 3;
+
     for (int row = 0; row < ROWS; row++) {
       for (int col = 0; col < COLS; col++) {
         const char *label = KEYS[row][col];
         int len2 = (int)strlen(label);
         if (len2 > BTN_CHARS) len2 = BTN_CHARS;
-        char buf[BTN_CHARS + 1];
-        memset(buf, ' ', BTN_CHARS);
-        buf[BTN_CHARS] = 0;
-        memcpy(buf + (BTN_CHARS - len2) / 2, label, (size_t)len2);
-
-        int colX = col * BTN_W, textX = colX + (BTN_W - BTN_CHARS * CHAR_W) / 2;
+        // Печатаем только саму надпись, без пробелов-отступов: инвертированные пробелы
+        // закрашивали углы плашки и скругление не было видно.
+        int colX = col * BTN_W, textX = colX + (BTN_W - len2 * CHAR_W) / 2;
         int lineY = FIRST_ROW + row, btnY = lineY * CHAR_H;
         bool isSel = (row * COLS + col) == sel;
         if (isSel) {
-          oled.rect(colX + 1, btnY - 1, colX + BTN_W - 2, btnY + CHAR_H - 1, OLED_FILL);
+          // плашка: по одному срезанному пикселю в каждом углу (сплошные прямоугольники, без отдельных точек)
+          oled.rect(colX + 2, btnY - 1, colX + BTN_W - 3, btnY + 7, OLED_FILL);
+          oled.rect(colX + 1, btnY,     colX + BTN_W - 2, btnY + 6, OLED_FILL);
           oled.invertText(true);
         }
         oled.setCursor(textX, lineY);
-        oled.print(buf);
+        oled.print(label);
         if (isSel) oled.invertText(false);
       }
     }
@@ -1144,7 +1158,7 @@ class WebUI {
           "<button type='submit'>Загрузить файл</button></form></div>");
     o.raw("<div class='card'><h3>Загрузить картинку (128x64)</h3><form method='POST' action='/upload_img'>");
     hidden(o, "dir", dir);
-    o.raw(R"JS(<label style='display:block;padding:14px;border:2px dashed var(--acc);border-radius:10px;text-align:center;color:var(--acc);font-weight:600;cursor:pointer;margin:6px 0 12px'><span id='pn'>&#128444; Выбрать картинку</span><input type='file' id='pf' accept='image/*' hidden></label>
+    o.raw(R"JS(<label style='display:block;padding:14px;border:2px dashed var(--acc);border-radius:10px;text-align:center;color:var(--acc);font-weight:600;cursor:pointer;margin:6px 0 12px;position:relative;overflow:hidden'><span id='pn'>&#128444; Выбрать картинку</span><input type='file' id='pf' accept='image/*' style='position:absolute;inset:0;width:100%;height:100%;margin:0;padding:0;border:0;opacity:0;cursor:pointer;font-size:16px'></label>
 <label style='display:flex;align-items:center;gap:10px;font-size:13px;margin-bottom:10px'>Порог<input type='range' id='pt' min='1' max='254' value='128' style='flex:1;width:auto;margin:0;padding:0;border:0;background:none;accent-color:var(--acc)'></label>
 <label style='display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px'><input type='checkbox' id='pi' style='width:auto;margin:0;accent-color:var(--acc)'>Инвертировать</label>
 <canvas id='pc' width='128' height='64' style='width:100%;image-rendering:pixelated;background:#000;border-radius:8px;display:none;margin-bottom:8px'></canvas>
@@ -1522,7 +1536,7 @@ th.oninput=iv.onchange=go})();</script>)JS");
   }
 };
 
-class Game {
+class FlappyBird {
  public:
   int best = 0;
   void reset() {
@@ -1632,6 +1646,173 @@ class Game {
   }
 };
 
+class Tetris {
+ public:
+  int best = 0;
+  void reset() {
+    // каждая игра - новая последовательность: аппаратный генератор + время + счётчик запусков
+    static uint32_t runs = 0;
+    rng = esp_random() ^ (micros() * 2654435761u) ^ (millis() << 7) ^ (++runs * 0x9E3779B9u);
+    if (!rng) rng = 0x1234567;
+    for (int i = 0; i < 8; i++) nextRand();
+    memset(rows, 0, sizeof rows);
+    score = 0; lines = 0; level = 1; over = false;
+    bagPos = 7;
+    nextType = takeFromBag();
+    spawn();
+    last = millis();
+  }
+  bool tick(uint32_t now) {
+    if (over || now - last < (uint32_t)interval()) return false;
+    last = now;
+    if (!collides(px, py + 1, rot)) py++;
+    else lockPiece();
+    return true;
+  }
+  void move(int dir, uint32_t now) {
+    lastMoved = false;
+    lastDir = dir;
+    lastMoveAt = now;
+    if (over) return;
+    if (!collides(px + dir, py, rot)) { px += dir; lastMoved = true; }
+  }
+  // ОК: поворот (в конце игры - новая игра)
+  void rotate() {
+    if (over) { if (millis() - overAt > 500) reset(); return; }
+    int nr = (rot + 1) & 3;
+    static const int KICK[5] = {0, -1, 1, -2, 2};
+    for (int k : KICK) if (!collides(px + k, py, nr)) { px += k; rot = nr; return; }
+  }
+
+  // обе кнопки вместе: если одна из них только что сдвинула фигуру - отменяем сдвиг (ускорение включает флаг fast)
+  void chordStart(uint32_t now) {
+    if (over) return;
+    if (lastMoved && now - lastMoveAt < 160) { px -= lastDir; lastMoved = false; }
+  }
+  bool fast = false;  // пока обе кнопки зажаты, фигура падает в 3 раза быстрее
+
+  // Экран повёрнут влево на 90°: фигуры падают слева направо (к кнопкам), игровое "вправо" - вверх по экрану
+  void draw(Oled &oled) const {
+    oled.rect(X0 - 2, Y0 - 2, X0 + H * CELL, Y0 + W * CELL, OLED_STROKE);
+    for (int v = 0; v < H; v++)
+      for (int u = 0; u < W; u++)
+        if (rows[v] & (1u << u)) cell(oled, u, v);
+    if (!over) {
+      uint16_t m = SHAPES[type][rot];
+      for (int i = 0; i < 16; i++) {
+        if (!(m & (0x8000 >> i))) continue;
+        int cu = px + (i & 3), cv = py + (i >> 2);
+        if (cv >= 0) cell(oled, cu, cv);
+      }
+    } else {
+      drawScore(oled);
+    }
+  }
+
+ private:
+  enum { W = 10, H = 20, CELL = 6, X0 = 5, Y0 = 2 };
+  static const uint16_t SHAPES[7][4];
+  uint16_t rows[H] = {};
+  int px = 3, py = 0, rot = 0, type = 0, nextType = 0;
+  int score = 0, lines = 0, level = 1, lastDir = 0, bagPos = 7;
+  bool over = false, lastMoved = false;
+  uint32_t overAt = 0, last = 0, lastMoveAt = 0, rng = 1;
+  uint8_t bag[7] = {};
+
+  int interval() const { int v = 700 - (level - 1) * 60; if (v < 90) v = 90; return fast ? (v / 4 < 25 ? 25 : v / 4) : v; }
+
+  uint32_t nextRand() {  // xorshift32, засеивается в reset()
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return rng;
+  }
+  int takeFromBag() {  // "мешок" из 7 фигур: без длинных серий одинаковых
+    if (bagPos >= 7) {
+      for (int i = 0; i < 7; i++) bag[i] = (uint8_t)i;
+      for (int i = 6; i > 0; i--) { int j = (int)(nextRand() % (uint32_t)(i + 1)); uint8_t t = bag[i]; bag[i] = bag[j]; bag[j] = t; }
+      bagPos = 0;
+    }
+    return bag[bagPos++];
+  }
+  void spawn() {
+    type = nextType;
+    nextType = takeFromBag();
+    rot = 0; px = 3; py = 0;
+    if (collides(px, py, rot)) { over = true; overAt = millis(); }
+  }
+  bool collides(int x, int y, int r) const {
+    uint16_t m = SHAPES[type][r];
+    for (int i = 0; i < 16; i++) {
+      if (!(m & (0x8000 >> i))) continue;
+      int cx = x + (i & 3), cy = y + (i >> 2);
+      if (cx < 0 || cx >= W || cy >= H) return true;
+      if (cy >= 0 && (rows[cy] & (1u << cx))) return true;
+    }
+    return false;
+  }
+  void lockPiece() {
+    uint16_t m = SHAPES[type][rot];
+    for (int i = 0; i < 16; i++) {
+      if (!(m & (0x8000 >> i))) continue;
+      int cx = px + (i & 3), cy = py + (i >> 2);
+      if (cy >= 0) rows[cy] |= (uint16_t)(1u << cx);
+    }
+    const uint16_t FULL = (1u << W) - 1;
+    int cleared = 0;
+    for (int y = H - 1; y >= 0;) {
+      if (rows[y] == FULL) {
+        for (int k = y; k > 0; k--) rows[k] = rows[k - 1];
+        rows[0] = 0;
+        cleared++;
+      } else y--;
+    }
+    if (cleared) {
+      static const int PTS[5] = {0, 100, 300, 500, 800};
+      score += PTS[cleared] * level;
+      lines += cleared;
+      level = lines / 10 + 1;
+    }
+    if (score > best) best = score;
+    spawn();
+  }
+  // кубик 5x5 с зазором в 1 px и квадратным вырезом по центру; u - столбец поля, v - ряд (сверху вниз)
+  static void cell(Oled &o, int u, int v) {
+    int sx = X0 + v * CELL, sy = Y0 + (W - 1 - u) * CELL;
+    o.rect(sx, sy, sx + 4, sy + 4, OLED_FILL);
+    o.rect(sx + 1, sy + 1, sx + 3, sy + 3, OLED_CLEAR);  // квадратный вырез 3x3
+  }
+
+  // Конец игры: рамка со счётом, цифры повёрнуты так же, как поле (3x5 пикселей, масштаб 2)
+  void drawScore(Oled &oled) const {
+    static const uint8_t DIG[10][5] = {{7,5,5,5,7},{2,6,2,2,7},{7,1,7,4,7},{7,1,7,1,7},{5,5,7,1,1},
+                                       {7,4,7,1,7},{7,4,7,5,7},{7,1,1,1,1},{7,5,7,5,7},{7,5,7,1,7}};
+    char b[12];
+    snprintf(b, sizeof b, "%d", score);
+    int n = (int)strlen(b), S = 2;
+    int len = (4 * n - 1) * S;                 // длина строки цифр (вдоль экрана снизу вверх)
+    int x0 = 64 - 5 * S / 2, yBottom = 32 + len / 2;
+    oled.rect(x0 - 4, 32 - len / 2 - 4, x0 + 5 * S + 3, yBottom + 3, OLED_CLEAR);
+    oled.rect(x0 - 4, 32 - len / 2 - 4, x0 + 5 * S + 3, yBottom + 3, OLED_STROKE);
+    for (int d = 0; d < n; d++)
+      for (int gv = 0; gv < 5; gv++)
+        for (int gu = 0; gu < 3; gu++)
+          if (DIG[b[d] - '0'][gv] & (4 >> gu)) {
+            int sx = x0 + gv * S, sy = yBottom - (d * 4 + gu + 1) * S;
+            oled.rect(sx, sy, sx + S - 1, sy + S - 1, OLED_FILL);
+          }
+  }
+};
+
+// I, O, T, S, Z, J, L: по 4 поворота, матрица 4x4 в 16 битах (старший бит - левый верхний угол)
+const uint16_t Tetris::SHAPES[7][4] = {
+  {0x0F00, 0x2222, 0x00F0, 0x4444},
+  {0x6600, 0x6600, 0x6600, 0x6600},
+  {0x4E00, 0x4640, 0x0E40, 0x4C40},
+  {0x6C00, 0x4620, 0x06C0, 0x8C40},
+  {0xC600, 0x2640, 0x0C60, 0x4C80},
+  {0x8E00, 0x6440, 0x0E20, 0x44C0},
+  {0x2E00, 0x4460, 0x0E80, 0xC440},
+};
+
 class App : public WebHooks {
  public:
   App() : web(settings, files, *this) {}
@@ -1668,10 +1849,15 @@ class App : public WebHooks {
     else if (settings.sleepEnabled && settings.sleepTimeoutMs() > 0 && now - lastActivity >= settings.sleepTimeoutMs()) enterLightSleep();
 
     handleButtons(now);
-    if (state == ST_GAME) {
+    if (state == ST_FLAPPY) {
       lastActivity = now;
-      if (game.tick(now)) draw();
-      if (game.best > settings.best) { settings.best = game.best; settings.touch(now); }
+      if (flappy.tick(now)) draw();
+      if (flappy.best > settings.best) { settings.best = flappy.best; settings.touch(now); }
+    }
+    if (state == ST_TETRIS) {
+      lastActivity = now;
+      if (tetris.tick(now)) draw();
+      if (tetris.best > settings.tetBest) { settings.tetBest = tetris.best; settings.touch(now); }
     }
     if (state == ST_PROMPT) {
       lastActivity = now;  // во время суфлёра не засыпаем
@@ -1691,14 +1877,15 @@ class App : public WebHooks {
   void sleepChanged() override { lastActivity = millis(); }
 
  private:
-  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_GAME, ST_PROMPT };
+  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_FLAPPY, ST_TETRIS, ST_PROMPT };
 
   Oled oled;
   Settings settings;
   FileBrowser files;
   Reader reader;
   Calculator calc;
-  Game game;
+  FlappyBird flappy;
+  Tetris tetris;
   WebUI web;
   Button up, down, ok;
   State state = ST_LIST;
@@ -1718,7 +1905,8 @@ class App : public WebHooks {
     switch (state) {
       case ST_LIST: case ST_MARK: files.draw(oled); break;
       case ST_CONFIRM: drawConfirm(); break;
-      case ST_GAME: game.draw(oled); break;
+      case ST_FLAPPY: flappy.draw(oled); break;
+      case ST_TETRIS: tetris.draw(oled); break;
       case ST_VIEW: case ST_PROMPT: reader.draw(oled); break;
       case ST_WIFI: drawWifiInfo(); break;
       case ST_CALC: calc.draw(oled); break;
@@ -1761,9 +1949,16 @@ class App : public WebHooks {
     }
     if (!strcmp(c, "0000")) {  // Flappy Bird
       calc.reset();
-      game.best = settings.best;
-      game.reset();
-      state = ST_GAME;
+      flappy.best = settings.best;
+      flappy.reset();
+      state = ST_FLAPPY;
+      return true;
+    }
+    if (!strcmp(c, "0001")) {  // Tetris
+      calc.reset();
+      tetris.best = settings.tetBest;
+      tetris.reset();
+      state = ST_TETRIS;
       return true;
     }
     if (!strcmp(c, "2222")) {  // режим удаления
@@ -1792,8 +1987,8 @@ class App : public WebHooks {
     oled.setPower(false);
     gpio_wakeup_enable((gpio_num_t)cfg::PIN_UP, GPIO_INTR_LOW_LEVEL);
     gpio_wakeup_enable((gpio_num_t)cfg::PIN_DOWN, GPIO_INTR_LOW_LEVEL);
-    gpio_wakeup_enable((gpio_num_t)cfg::PIN_OK, GPIO_INTR_LOW_LEVEL);
-    esp_sleep_enable_gpio_wakeup();
+    gpio_wakeup_enable((gpio_num_t)cfg::PIN_OK, GPIO_INTR_LOW_LEVEL); 
+    esp_sleep_enable_gpio_wakeup(); 
     esp_light_sleep_start();
     justWoke = true;  
     lastActivity = millis();
@@ -1811,14 +2006,19 @@ class App : public WebHooks {
     bool anyHeld = up.stable || down.stable || ok.stable;
     bool anyPressed = up.pressed || down.pressed || ok.pressed;
     if (justWoke) { if (!anyHeld) justWoke = false; return; }
+    if (state == ST_TETRIS) tetris.fast = up.stable && down.stable;
     if (anyHeld || anyPressed || up.repeat || down.repeat) lastActivity = now;
 
     if (up.stable && down.stable) {  // обе кнопки дольше 0.4 с - калькулятор
+      if (state == ST_TETRIS) {  // в тетрисе обе кнопки = ускорение падения в 3 раза
+        if (!bothHeld) { bothHeld = true; tetris.chordStart(now); }
+        return;
+      }
       if (!bothHeld) { bothHeld = true; bothDone = false; bothSince = now; }
       else if (!bothDone && now - bothSince > 400) {
         bothDone = true;
         if (state == ST_MARK || state == ST_CONFIRM) { files.endMark(); state = ST_LIST; draw(); }  // выход из режима удаления
-        else if (state != ST_CALC && state != ST_GAME && state != ST_PROMPT) { calc.reset(); state = ST_CALC; draw(); }
+        else if (state != ST_CALC && state != ST_FLAPPY && state != ST_TETRIS && state != ST_PROMPT) { calc.reset(); state = ST_CALC; draw(); }
       }
       return;
     }
@@ -1863,10 +2063,16 @@ class App : public WebHooks {
         if (downStep) changeBrightness(-15);
         if (ok.longPress) toggleWifi();
         break;
-      case ST_GAME:
-        if (navUp.pressed) { game.flap(); draw(); }
-        if (navDown.pressed) { game.pause(); draw(); }
+      case ST_FLAPPY:
+        if (navUp.pressed) { flappy.flap(); draw(); }
+        if (navDown.pressed) { flappy.pause(); draw(); }
         if (ok.released && !ok.longFired) { state = web.active() ? ST_WIFI : ST_LIST; draw(); }
+        break;
+      case ST_TETRIS:
+        if (up.pressed || up.repeat) { tetris.move(1, now); draw(); }     // фигура вверх по экрану
+        if (down.pressed || down.repeat) { tetris.move(-1, now); draw(); }  // вниз по экрану
+        if (ok.released && !ok.longFired) { tetris.rotate(); draw(); }  // быстрое нажатие - поворот
+        if (ok.longPress) { state = web.active() ? ST_WIFI : ST_LIST; draw(); }  // зажать - выход
         break;
       case ST_MARK:
         if (upStep) { files.move(-1); draw(); }
