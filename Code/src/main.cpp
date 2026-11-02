@@ -14,7 +14,7 @@
 #include <math.h>
 
 namespace cfg {
-constexpr uint8_t PIN_SDA = 11, PIN_SCL = 13, PIN_UP = 5, PIN_DOWN = 7, PIN_OK = 6;
+constexpr uint8_t PIN_SDA = 11, PIN_SCL = 13, PIN_UP = 5, PIN_DOWN = 7, PIN_OK = 6, PIN_RGB = 48;  // PIN_RGB - встроенный WS2812 на ESP32-S3 SuperMini
 constexpr int SCREEN_ROWS = 8;         // строк текста на экране
 constexpr int CHARS_PER_LINE = 21;     // символов в строке
 constexpr int PATH_LEN = 128;          // макс. длина пути в байтах (кириллица = 2 байта на букву)
@@ -198,6 +198,8 @@ class Settings {
   int webTheme = 0;
   int best = 0;  // рекорд Flappy Bird
   int tetBest = 0;  // рекорд Tetris
+  int marBest = 0;  // рекорд Mario
+  bool rgbBoot = false;  // подсветка включается при старте (код 1010)
   int promptCs = 100;  // суфлёр: секунд на строку, в сотых (100 = 1.00 с)
   char ssid[33];
   char pass[65];
@@ -219,9 +221,9 @@ class Settings {
     if (!LittleFS.exists(cfg::SETTINGS_PATH)) return;
     File f = LittleFS.open(cfg::SETTINGS_PATH, "r");
     if (!f) return;
-    char l[12][cfg::PATH_LEN];
+    char l[14][cfg::PATH_LEN];
     int got = 0;
-    while (got < 12 && f.available()) {
+    while (got < 14 && f.available()) {
       fsx::readLine(f, l[got], cfg::PATH_LEN);
       str::trim(l[got]);
       got++;
@@ -239,6 +241,8 @@ class Settings {
     if (got > 9 && l[9][0]) best = constrain(atoi(l[9]), 0, 99999);
     if (got > 10 && l[10][0]) promptCs = constrain(atoi(l[10]), 5, 6000);
     if (got > 11 && l[11][0]) tetBest = constrain(atoi(l[11]), 0, 999999);
+    if (got > 12 && l[12][0]) marBest = constrain(atoi(l[12]), 0, 999999);
+    if (got > 13 && l[13][0]) rgbBoot = atoi(l[13]) == 1;
   }
   void save() const {
     File f = LittleFS.open(cfg::SETTINGS_PATH, "w");
@@ -255,6 +259,8 @@ class Settings {
     f.println(best);
     f.println(promptCs);
     f.println(tetBest);
+    f.println(marBest);
+    f.println(rgbBoot ? 1 : 0);
     f.close();
   }
 
@@ -1813,6 +1819,275 @@ const uint16_t Tetris::SHAPES[7][4] = {
   {0x2E00, 0x4460, 0x0E80, 0xC440},
 };
 
+namespace mspr {
+const uint8_t TL[9][5] = {{0,0,0,0,0},{0x1F,0x15,0x0A,0x15,0x0A},{0x1E,0x1E,0x00,0x0F,0x0F},{0x1F,0x11,0x15,0x11,0x1F},
+  {0x1F,0x11,0x11,0x11,0x1F},{0x1F,0x1F,0x1B,0x1F,0x1F},{0x1D,0x1D,0x1D,0x1D,0x1D},{0x1F,0x1F,0x15,0x1F,0x1F},{0x1F,0x11,0x15,0x11,0x1F}};
+const uint8_t MS[5] = {0x0E,0x0F,0x0E,0x1F,0x1B};
+const uint8_t MB[10] = {0x0E,0x0F,0x0E,0x0E,0x1F,0x1F,0x0E,0x0E,0x1B,0x1B};
+const uint8_t GO[5] = {0x0E,0x1F,0x15,0x0E,0x1B};
+const uint8_t SQ[2] = {0x0E,0x1F};
+const uint8_t KO[6] = {0x0C,0x0E,0x0C,0x1F,0x1F,0x0A};
+const uint8_t SH[3] = {0x0E,0x1F,0x1F};
+const uint8_t MU[5] = {0x0E,0x1F,0x15,0x0E,0x0E};
+const uint8_t DG[10][5] = {{7,5,5,5,7},{2,6,2,2,7},{7,1,7,4,7},{7,1,7,1,7},{5,5,7,1,1},{7,4,7,1,7},{7,4,7,5,7},{7,1,1,1,1},{7,5,7,5,7},{7,5,7,1,7}};
+}
+
+// Super Mario Bros, уровень 1-1. Тайл 5 px (16 px оригинала), физика в тайлах/кадр при 60 Гц.
+// ▲ = влево, ▼ = вправо, ОК = прыжок (держать - выше), ОК 1 с = выход
+class Mario {
+ public:
+  int best = 0;
+  bool inL = false, inR = false, inA = false;
+  void start() { score = 0; coins = 0; lives = 3; load(); }
+  void jump() {
+    if (st == OVER || st == WIN) { if (millis() - endAt > 700) start(); }
+    else jumpReq = 6;
+  }
+  bool tick(uint32_t now) {
+    if (now - last < 33) return false;
+    acc += now - last; last = now;
+    for (int n = 0; acc >= 16 && n < 4; n++, acc -= 16) step();
+    if (acc > 16) acc = 0;
+    if (score > best) best = score;
+    return true;
+  }
+  void draw(Oled &o) const {
+    using namespace mspr;
+    int cam = (int)(camX * T);
+    for (int c = cam / T; c <= cam / T + 26 && c < COLS; c++)
+      for (int r = 0; r < ROWS; r++) if (map[c][r]) spr(o, c * T - cam, OY + r * T, TL[map[c][r]], 5, false);
+    int px = FLAGX * T - cam;
+    if (px > -8 && px < 128) {
+      o.rect(px, OY + T, px, OY + (G - 1) * T - 1, OLED_FILL);
+      int fy = OY + (int)(flagY * T);
+      for (int k = 0; k < 5; k++) o.rect(px - 5 + k, fy + k, px - 1, fy + k, OLED_FILL);
+    }
+    int cx = 202 * T - cam;
+    if (cx > -30 && cx < 128) {
+      o.rect(cx, OY + 6 * T, cx + 5 * T - 1, OY + G * T - 1, OLED_STROKE);
+      o.rect(cx + 2 * T, OY + 8 * T, cx + 3 * T - 1, OY + G * T - 1, OLED_STROKE);
+      o.rect(cx, OY + 5 * T + 2, cx + 1, OY + 6 * T, OLED_FILL);
+      o.rect(cx + 5 * T - 2, OY + 5 * T + 2, cx + 5 * T - 1, OY + 6 * T, OLED_FILL);
+    }
+    for (const auto &e : en) if (e.al && e.on) {
+      int sx = (int)((e.x - 0.5f) * T) - cam, sy = OY + (int)(e.y * T + 0.5f);
+      if (e.type == 0) { if (e.t) spr(o, sx, sy - 2, SQ, 2, false); else spr(o, sx, sy - 5, GO, 5, (frame >> 3) & 1); }
+      else if (e.type == 1) spr(o, sx, sy - 6, KO, 6, e.vx > 0);
+      else if (e.type == 2) spr(o, sx, sy - 3, SH, 3, false);
+      else spr(o, sx, sy - 5, MU, 5, false);
+    }
+    for (const auto &f : fx) if (f.t) { int a = (int)(f.x * T) - cam, b = OY + (int)(f.y * T); o.rect(a - 1, b - 1, a + 1, b + 1, OLED_STROKE); }
+    if (st != WIN && !(inv && (frame & 2))) {
+      uint8_t m[10]; int n = big ? 10 : 5;
+      memcpy(m, big ? MB : MS, n);
+      m[n - 1] = !ground ? 0x11 : (fabsf(vx) > 0.01f && ((int)(x * 6) & 1)) ? 0x0A : 0x1B;
+      spr(o, (int)((x - 0.5f) * T) - cam, OY + (int)(y * T + 0.5f) - n, m, n, !face);
+    }
+    num(o, 0, score, 6);
+    o.rect(30, 1, 32, 3, OLED_STROKE); num(o, 36, coins, 2);
+    o.dot(60, 1, 1); o.dot(62, 1, 1); o.dot(61, 2, 1); o.dot(60, 3, 1); o.dot(62, 3, 1); num(o, 65, lives, 1);
+    num(o, 108, timeLeft, 3);
+    if (st == OVER || st == WIN) {
+      o.rect(22, 20, 105, 43, OLED_CLEAR); o.rect(22, 20, 105, 43, OLED_STROKE);
+      o.setCursor(st == OVER ? 40 : 28, 3); o.print(st == OVER ? "GAME OVER" : "COURSE CLEAR");
+      o.setCursor(46, 4); o.print(score);
+    }
+  }
+
+ private:
+  enum { COLS = 212, ROWS = 12, T = 5, OY = 4, G = 10, FLAGX = 198, MAXE = 24 };
+  enum St { PLAY, DIE, FLAG, WALK, OVER, WIN };
+  static constexpr float HW = 0.375f, VMAX = 0.0977f;
+  struct En { float x, y, vx, vy; uint8_t type, t, k; bool al, on; };  // type: 0 гумба, 1 купа, 2 панцирь, 3 гриб
+  struct Fx { float x, y; uint8_t t; };
+  uint8_t map[COLS][ROWS];
+  En en[MAXE];
+  Fx fx[4];
+  St st = PLAY;
+  float x = 3.5f, y = G, vx = 0, vy = 0, camX = 0, flagY = 1.5f;
+  int score = 0, coins = 0, lives = 3, timeLeft = 400, jumpReq = 0, dieT = 0;
+  uint8_t inv = 0;
+  uint32_t frame = 0, last = 0, acc = 0, endAt = 0;
+  bool big = false, ground = true, face = true;
+
+  bool sol(int c, int r) const {
+    if (c < 0 || c >= COLS) return true;
+    if (r < 0 || r >= ROWS) return false;
+    return map[c][r] != 0;
+  }
+  bool hit(float nx, float ny, float h) const {
+    int c0 = floorf(nx - HW), c1 = floorf(nx + HW), r0 = floorf(ny - h + 0.02f), r1 = floorf(ny - 0.02f);
+    for (int c = c0; c <= c1; c++) for (int r = r0; r <= r1; r++) if (sol(c, r)) return true;
+    return false;
+  }
+  static void spr(Oled &o, int sx, int sy, const uint8_t *rw, int n, bool flip) {
+    for (int j = 0; j < n; j++) for (int i = 0; i < 5; i++)
+      if (rw[j] & (1 << (flip ? i : 4 - i))) {
+        int a = sx + i, b = sy + j;
+        if (a >= 0 && a < 128 && b >= 0 && b < 64) o.dot(a, b, 1);
+      }
+  }
+  static void num(Oled &o, int x0, int v, int n) {
+    if (v < 0) v = 0;
+    for (int i = n - 1; i >= 0; i--, v /= 10)
+      for (int gv = 0; gv < 5; gv++) for (int gu = 0; gu < 3; gu++)
+        if (mspr::DG[v % 10][gv] & (4 >> gu)) o.dot(x0 + i * 4 + gu, gv, 1);
+  }
+
+  void load() {
+    memset(map, 0, sizeof map); memset(en, 0, sizeof en); memset(fx, 0, sizeof fx);
+    static const uint8_t PIT[] = {69, 70, 86, 87, 88, 153, 154};
+    for (int c = 0; c < COLS; c++) {
+      bool p = false;
+      for (uint8_t q : PIT) p |= (q == c);
+      if (!p) map[c][G] = map[c][G + 1] = 1;
+    }
+    auto B = [&](int c, int r, uint8_t t) { map[c][r] = t; };
+    auto stair = [&](int c0, int n, int dir) { for (int i = 0; i < n; i++) for (int k = 1; k <= (dir > 0 ? i + 1 : n - i); k++) map[c0 + i][G - k] = 5; };
+    auto pipe = [&](int c, int h) { for (int k = 1; k <= h; k++) map[c][G - k] = map[c + 1][G - k] = (k == h ? 7 : 6); };
+    B(16, 6, 3); B(20, 6, 2); B(21, 6, 8); B(22, 6, 2); B(23, 6, 3); B(24, 6, 2); B(22, 2, 3);
+    pipe(28, 2); pipe(38, 3); pipe(46, 4); pipe(57, 4);
+    B(77, 6, 2); B(78, 6, 8); B(79, 6, 2);
+    for (int c = 80; c < 88; c++) B(c, 2, 2);
+    for (int c = 91; c < 94; c++) B(c, 2, 2);
+    B(94, 2, 3); B(94, 6, 2); B(100, 6, 2); B(101, 6, 2);
+    B(106, 6, 3); B(109, 6, 3); B(112, 6, 3); B(109, 2, 8);
+    B(118, 6, 2); for (int c = 121; c < 124; c++) B(c, 2, 2);
+    B(129, 2, 3); B(130, 2, 3); B(129, 6, 2); B(130, 6, 2);
+    stair(134, 4, 1); stair(140, 4, -1); stair(148, 4, 1); stair(155, 4, -1);
+    pipe(163, 2); B(168, 6, 2); B(169, 6, 2); B(170, 6, 3); B(171, 6, 2); pipe(179, 2);
+    stair(181, 8, 1);
+    for (int k = 1; k <= 8; k++) map[189][G - k] = 5;
+    map[FLAGX][G - 1] = 5;
+    static const uint8_t GM[] = {22, 40, 51, 53, 80, 82, 97, 99, 114, 116, 124, 126, 128, 130, 174, 176};
+    int n = 0;
+    for (uint8_t c : GM) en[n++] = {c + 0.5f, (float)G, -0.031f, 0, 0, 0, 0, true, false};
+    en[n++] = {107.5f, (float)G, -0.031f, 0, 1, 0, 0, true, false};
+    x = 3.5f; y = G; vx = vy = 0; camX = 0; big = false; inv = 0; ground = true; face = true;
+    st = PLAY; timeLeft = 400; frame = 0; jumpReq = 0; flagY = 1.5f; last = millis(); acc = 0;
+  }
+
+  void hurt(bool kill) {
+    if (!kill && inv) return;
+    if (!kill && big) { big = false; inv = 120; return; }
+    st = DIE; dieT = 0; vx = 0; vy = y > ROWS ? 0 : -0.25f;
+  }
+
+  void bump(int c, int r) {
+    if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return;
+    uint8_t t = map[c][r];
+    for (auto &e : en) if (e.al && e.on && e.type < 3 && !e.t && (int)floorf(e.x) == c && fabsf(e.y - r) < 0.3f) { e.al = false; score += 100; }
+    if (t == 2 && big) { map[c][r] = 0; score += 50; }
+    else if (t == 3) {
+      map[c][r] = 4; score += 200;
+      if (++coins >= 100) { coins -= 100; lives++; }
+      for (auto &f : fx) if (!f.t) { f = {c + 0.5f, r - 0.5f, 18}; break; }
+    } else if (t == 8) {
+      map[c][r] = 4;
+      for (auto &e : en) if (!e.al) { e = {c + 0.5f, (float)r, 0.0625f, 0, 3, 0, 0, true, true}; break; }
+    }
+  }
+
+  void step() {
+    frame++;
+    for (auto &f : fx) if (f.t) { f.t--; f.y -= 0.1f; }
+    if (st == OVER || st == WIN) return;
+    if (st == DIE) {
+      if (++dieT > 20) { vy += 0.0254f; if (vy > 0.25f) vy = 0.25f; y += vy; }
+      if (y > ROWS + 4) { if (lives > 1) { lives--; load(); } else { st = OVER; endAt = millis(); } }
+      return;
+    }
+    if (inv) inv--;
+    if (st == PLAY && frame % 24 == 0 && --timeLeft <= 0) { hurt(true); return; }
+    moveMario();
+    if (st == PLAY) touch();
+    enemies();
+    float tg = x - 11.0f;
+    if (tg > camX) camX = tg;
+    if (camX > COLS - 25.6f) camX = COLS - 25.6f;
+  }
+
+  void moveMario() {
+    float h = big ? 1.9f : 0.9f;
+    if (st == FLAG) {
+      y += 0.125f; if (flagY < 8.0f) flagY += 0.125f;
+      if (y >= G) { y = G; st = WALK; x = FLAGX + 1 + HW; vx = 0; vy = 0; ground = true; }
+      return;
+    }
+    bool R = (inR && st == PLAY) || st == WALK, L = inL && st == PLAY;
+    float d = (R && !L) ? 1 : (L && !R) ? -1 : 0;
+    vx = d * VMAX;  // без разгона: всегда постоянная скорость
+    if (d) face = d > 0;
+    if (jumpReq) jumpReq--;
+    if (jumpReq && ground && st == PLAY) { vy = -0.25f - fabsf(vx) * 0.2f; jumpReq = 0; ground = false; }
+    vy += (vy < 0 && inA) ? 0.00727f : 0.0254f;
+    if (vy > 0.25f) vy = 0.25f;
+    float nx = x + vx;
+    if (hit(nx, y, h)) { nx = vx > 0 ? floorf(nx + HW) - HW - 0.001f : floorf(nx - HW) + 1 + HW + 0.001f; vx = 0; }
+    x = nx;
+    if (x - HW < camX) { x = camX + HW; if (vx < 0) vx = 0; }
+    ground = false;
+    float ny = y + vy;
+    int cl = floorf(x - HW), cr = floorf(x + HW);
+    if (vy >= 0) {
+      int ty = floorf(ny);
+      if (ty >= 0 && ty < ROWS && (sol(cl, ty) || sol(cr, ty)) && y <= ty + 0.001f) { y = ty; vy = 0; ground = true; }
+      else y = ny;
+    } else {
+      int ty = floorf(ny - h);
+      if (sol(cl, ty) || sol(cr, ty)) {
+        int tc = sol((int)floorf(x), ty) ? (int)floorf(x) : (sol(cl, ty) ? cl : cr);
+        y = ty + 1 + h + 0.001f; vy = 0; bump(tc, ty);
+      } else y = ny;
+    }
+    if (y > ROWS + 0.5f) { hurt(true); return; }
+    if (st == PLAY && x + HW >= FLAGX - 0.01f) {  // флагшток
+      st = FLAG; vx = 0; vy = 0; x = FLAGX - HW - 0.01f; flagY = 1.5f;
+      score += 100 + (int)(G - y) * 500;
+    }
+    if (st == WALK && x >= 203.5f) { st = WIN; score += timeLeft * 50; timeLeft = 0; endAt = millis(); }
+  }
+
+  void touch() {
+    float h = big ? 1.9f : 0.9f;
+    for (auto &e : en) {
+      if (!e.al || !e.on || e.t) continue;
+      float eh = e.type == 1 ? 1.2f : e.type == 2 ? 0.6f : 0.9f;
+      if (fabsf(e.x - x) > 0.75f || y < e.y - eh + 0.05f || y - h > e.y - 0.05f) continue;
+      if (e.type == 3) { e.al = false; score += 1000; big = true; continue; }
+      if (vy > 0 && y - (e.y - eh) < 0.6f) {  // прыжок сверху
+        if (e.type == 0) { e.t = 25; e.vx = 0; }
+        else if (e.type == 1) { e.type = 2; e.vx = 0; }
+        else e.vx = e.vx != 0 ? 0 : (x < e.x ? 0.19f : -0.19f);
+        e.k = 15; score += 100; vy = inA ? -0.2f : -0.13f;
+        if (e.type == 2 && e.vx != 0) inv = 12;
+      } else if (e.type == 2 && e.vx == 0) {
+        if (!e.k) { e.vx = x < e.x ? 0.19f : -0.19f; inv = 12; score += 400; }
+      } else hurt(false);
+    }
+  }
+
+  void enemies() {
+    for (auto &e : en) {
+      if (!e.al) continue;
+      if (!e.on) { if (e.x - camX < 26.5f) e.on = true; else continue; }
+      if (e.t) { if (--e.t == 0) e.al = false; continue; }
+      if (e.k) e.k--;
+      e.vy += 0.0156f; if (e.vy > 0.25f) e.vy = 0.25f;
+      if (e.vx != 0) {
+        float nx = e.x + e.vx, dx = e.vx > 0 ? 0.4f : -0.4f;
+        if (sol((int)floorf(nx + dx), (int)floorf(e.y - 0.3f))) e.vx = -e.vx; else e.x = nx;
+      }
+      float ny = e.y + e.vy; int ty = floorf(ny);
+      if (e.vy > 0 && ty < ROWS && (sol((int)floorf(e.x - 0.35f), ty) || sol((int)floorf(e.x + 0.35f), ty)) && e.y <= ty + 0.001f) { e.y = ty; e.vy = 0; }
+      else e.y = ny;
+      if (e.y > ROWS + 1 || e.x < camX - 3) { e.al = false; continue; }
+      if (e.type == 2 && e.vx != 0)  // летящий панцирь сбивает врагов
+        for (auto &o : en) if (&o != &e && o.al && o.on && !o.t && o.type < 2 && fabsf(o.x - e.x) < 0.8f && fabsf(o.y - e.y) < 0.8f) { o.al = false; score += 200; }
+    }
+  }
+};
+
 class App : public WebHooks {
  public:
   App() : web(settings, files, *this) {}
@@ -1832,6 +2107,7 @@ class App : public WebHooks {
     WiFi.mode(WIFI_OFF);
     web.setup();
     settings.load();
+    rgbOn = settings.rgbBoot;
     files.openAt(settings.lastFile);
     oled.setContrast(settings.brightness);
     applyOrientation();
@@ -1845,8 +2121,15 @@ class App : public WebHooks {
     down.update(now);
     ok.update(now);
 
+    rgbTick(now);
+    if (dark && (up.stable || down.stable || ok.stable)) {  // пробуждение экрана (подсветка работала всё время)
+      dark = false; oled.setPower(true); justWoke = true; lastActivity = now; draw();
+    }
     if (web.active()) web.service();
-    else if (settings.sleepEnabled && settings.sleepTimeoutMs() > 0 && now - lastActivity >= settings.sleepTimeoutMs()) enterLightSleep();
+    else if (!dark && settings.sleepEnabled && settings.sleepTimeoutMs() > 0 && now - lastActivity >= settings.sleepTimeoutMs()) {
+      if (rgbOn) { oled.setPower(false); dark = true; }  // со светодиодом лёгкий сон не используем - он бы замер
+      else enterLightSleep();
+    }
 
     handleButtons(now);
     if (state == ST_FLAPPY) {
@@ -1858,6 +2141,11 @@ class App : public WebHooks {
       lastActivity = now;
       if (tetris.tick(now)) draw();
       if (tetris.best > settings.tetBest) { settings.tetBest = tetris.best; settings.touch(now); }
+    }
+    if (state == ST_MARIO) {
+      lastActivity = now;
+      if (mario.tick(now)) draw();
+      if (mario.best > settings.marBest) { settings.marBest = mario.best; settings.touch(now); }
     }
     if (state == ST_PROMPT) {
       lastActivity = now;  // во время суфлёра не засыпаем
@@ -1877,7 +2165,7 @@ class App : public WebHooks {
   void sleepChanged() override { lastActivity = millis(); }
 
  private:
-  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_FLAPPY, ST_TETRIS, ST_PROMPT };
+  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_FLAPPY, ST_TETRIS, ST_PROMPT, ST_MARIO };
 
   Oled oled;
   Settings settings;
@@ -1886,6 +2174,7 @@ class App : public WebHooks {
   Calculator calc;
   FlappyBird flappy;
   Tetris tetris;
+  Mario mario;
   WebUI web;
   Button up, down, ok;
   State state = ST_LIST;
@@ -1895,6 +2184,26 @@ class App : public WebHooks {
   uint32_t bothSince = 0;
   bool bothHeld = false;
   bool justWoke = false;
+  bool rgbOn = false, dark = false;
+  uint32_t rgbLast = 0;
+  int rgbHue = 0;
+
+  // плавная радуга на встроенном светодиоде: полный круг ~10 с
+  void rgbTick(uint32_t now) {
+    if (!rgbOn || now - rgbLast < 20) return;
+    rgbLast = now;
+    rgbHue = (rgbHue + 3) % 1536;
+    int f = rgbHue % 256, u = f, d = 255 - f, r, g, b;
+    switch (rgbHue / 256) {
+      case 0: r = 255; g = u; b = 0; break;
+      case 1: r = d; g = 255; b = 0; break;
+      case 2: r = 0; g = 255; b = u; break;
+      case 3: r = 0; g = d; b = 255; break;
+      case 4: r = u; g = 0; b = 255; break;
+      default: r = 255; g = 0; b = d; break;
+    }
+    neopixelWrite(cfg::PIN_RGB, r * 64 / 255, g * 64 / 255, b * 64 / 255);  // яркость 64/255
+  }
   bool bothDone = false;
   int confirmSel = 1;  // 0 = Да, 1 = Нет
 
@@ -1907,6 +2216,7 @@ class App : public WebHooks {
       case ST_CONFIRM: drawConfirm(); break;
       case ST_FLAPPY: flappy.draw(oled); break;
       case ST_TETRIS: tetris.draw(oled); break;
+      case ST_MARIO: mario.draw(oled); break;
       case ST_VIEW: case ST_PROMPT: reader.draw(oled); break;
       case ST_WIFI: drawWifiInfo(); break;
       case ST_CALC: calc.draw(oled); break;
@@ -1961,6 +2271,29 @@ class App : public WebHooks {
       state = ST_TETRIS;
       return true;
     }
+    if (!strcmp(c, "0002")) {  // Super Mario
+      calc.reset();
+      mario.best = settings.marBest;
+      mario.start();
+      state = ST_MARIO;
+      return true;
+    }
+    if (!strcmp(c, "0101")) {  // подсветка вкл/выкл (после перезагрузки сбрасывается)
+      calc.reset();
+      rgbOn = !rgbOn;
+      if (!rgbOn) neopixelWrite(cfg::PIN_RGB, 0, 0, 0);
+      return true;
+    }
+    if (!strcmp(c, "1010")) {  // закрепить подсветку после выключения (вкл/выкл), вспышка: зелёная - закреплено, красная - снято
+      calc.reset();
+      settings.rgbBoot = !settings.rgbBoot;
+      settings.touch(millis());
+      if (settings.rgbBoot) rgbOn = true;
+      neopixelWrite(cfg::PIN_RGB, settings.rgbBoot ? 0 : 64, settings.rgbBoot ? 64 : 0, 0);
+      delay(300);
+      neopixelWrite(cfg::PIN_RGB, 0, 0, 0);
+      return true;
+    }
     if (!strcmp(c, "2222")) {  // режим удаления
       calc.reset();
       files.beginMark();
@@ -2009,6 +2342,25 @@ class App : public WebHooks {
     if (state == ST_TETRIS) tetris.fast = up.stable && down.stable;
     if (anyHeld || anyPressed || up.repeat || down.repeat) lastActivity = now;
 
+    if (state == ST_FLAPPY || state == ST_TETRIS || state == ST_MARIO) {  // во всех играх: все кнопки вместе 1 с - выход
+      static uint32_t allSince = 0;
+      bool all = up.stable && down.stable && ok.stable;
+      if (!all) allSince = 0; else if (!allSince) allSince = now;
+      if (all && now - allSince >= 1000) {
+        mario.inL = mario.inR = mario.inA = false;
+        tetris.fast = false;
+        bothHeld = false;
+        justWoke = true;  // дождаться отпускания кнопок, чтобы не открылся калькулятор
+        state = web.active() ? ST_WIFI : ST_LIST; draw();
+        return;
+      }
+    }
+    if (state == ST_MARIO) {  // ▲ влево, ▼ вправо, ОК прыжок
+      Button &bl = settings.leftHanded ? down : up, &br = settings.leftHanded ? up : down;
+      mario.inL = bl.stable; mario.inR = br.stable; mario.inA = ok.stable;
+      if (ok.pressed) mario.jump();
+      return;
+    }
     if (up.stable && down.stable) {  // обе кнопки дольше 0.4 с - калькулятор
       if (state == ST_TETRIS) {  // в тетрисе обе кнопки = ускорение падения в 3 раза
         if (!bothHeld) { bothHeld = true; tetris.chordStart(now); }
@@ -2066,13 +2418,11 @@ class App : public WebHooks {
       case ST_FLAPPY:
         if (navUp.pressed) { flappy.flap(); draw(); }
         if (navDown.pressed) { flappy.pause(); draw(); }
-        if (ok.released && !ok.longFired) { state = web.active() ? ST_WIFI : ST_LIST; draw(); }
         break;
       case ST_TETRIS:
         if (up.pressed || up.repeat) { tetris.move(1, now); draw(); }     // фигура вверх по экрану
         if (down.pressed || down.repeat) { tetris.move(-1, now); draw(); }  // вниз по экрану
         if (ok.released && !ok.longFired) { tetris.rotate(); draw(); }  // быстрое нажатие - поворот
-        if (ok.longPress) { state = web.active() ? ST_WIFI : ST_LIST; draw(); }  // зажать - выход
         break;
       case ST_MARK:
         if (upStep) { files.move(-1); draw(); }
