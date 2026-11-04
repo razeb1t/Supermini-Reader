@@ -172,6 +172,9 @@ firmware: 10000
 ### Структура репозитория:
 ```text
 Supermini-Reader/
+├── 3D models/
+|   ├── box for Supermini-Reader.stl
+|   └── case for Supermini-Reader.stl
 ├── Code/
 │   ├── scr/
 |   |    └── main.cpp   <- исходный код 
