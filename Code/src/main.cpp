@@ -3,6 +3,8 @@
 #include <GyverOLED.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <DNSServer.h>
 #include <esp_system.h>
 #if __has_include(<esp_random.h>)
@@ -26,6 +28,8 @@ constexpr size_t IMG_BYTES = 1024;     // 128x64 бит
 constexpr uint32_t SCROLL_MS = 300;    // скорость бегущей строки
 constexpr uint32_t SAVE_DELAY_MS = 800;
 constexpr const char *SETTINGS_PATH = "/_cfg.txt";
+constexpr const char *AI_PATH = "/_ai.txt";  // временный файл с ответом ИИ
+constexpr int AI_Q_BYTES = 240;              // макс. длина вопроса к ИИ в байтах
 }  
 
 using Oled = GyverOLED<SSD1306_128x64, OLED_BUFFER>;
@@ -118,7 +122,7 @@ template <class Fn> void scanDir(const char *dir, Fn fn) {
   while (f) {
     const char *p = f.path();
     if (!p || !*p) { snprintf(tmp, sizeof tmp, "%s%s", dir, f.name()); p = tmp; }
-    if (!strstr(p, cfg::SETTINGS_PATH + 1) && !strstr(p, "_up.tmp")) fn(p, f);
+    if (!strstr(p, cfg::SETTINGS_PATH + 1) && !strstr(p, "_up.tmp") && !strstr(p, "_ai.txt")) fn(p, f);
     f = root.openNextFile();
   }
 }
@@ -204,6 +208,8 @@ class Settings {
   char ssid[33];
   char pass[65];
   char lastFile[cfg::PATH_LEN];
+  char staSsid[33] = "", staPass[65] = "", apiKey[128] = "", model[40] = "openai/gpt-4o-mini";  // ИИ: сеть для запросов и ключ ProxyAPI
+  bool aiReady() const { return staSsid[0] && apiKey[0]; }
 
   Settings() {
     strcpy(ssid, "Esp hpora");
@@ -221,9 +227,9 @@ class Settings {
     if (!LittleFS.exists(cfg::SETTINGS_PATH)) return;
     File f = LittleFS.open(cfg::SETTINGS_PATH, "r");
     if (!f) return;
-    char l[14][cfg::PATH_LEN];
+    char l[18][cfg::PATH_LEN];
     int got = 0;
-    while (got < 14 && f.available()) {
+    while (got < 18 && f.available()) {
       fsx::readLine(f, l[got], cfg::PATH_LEN);
       str::trim(l[got]);
       got++;
@@ -243,6 +249,10 @@ class Settings {
     if (got > 11 && l[11][0]) tetBest = constrain(atoi(l[11]), 0, 999999);
     if (got > 12 && l[12][0]) marBest = constrain(atoi(l[12]), 0, 999999);
     if (got > 13 && l[13][0]) rgbBoot = atoi(l[13]) == 1;
+    if (got > 14) strlcpy(staSsid, l[14], sizeof staSsid);
+    if (got > 15) strlcpy(staPass, l[15], sizeof staPass);
+    if (got > 16) strlcpy(apiKey, l[16], sizeof apiKey);
+    if (got > 17 && l[17][0]) strlcpy(model, l[17], sizeof model);
   }
   void save() const {
     File f = LittleFS.open(cfg::SETTINGS_PATH, "w");
@@ -261,6 +271,10 @@ class Settings {
     f.println(tetBest);
     f.println(marBest);
     f.println(rgbBoot ? 1 : 0);
+    f.println(staSsid);
+    f.println(staPass);
+    f.println(apiKey);
+    f.println(model);
     f.close();
   }
 
@@ -564,8 +578,10 @@ class LineReader {
 
 class Reader {
  public:
+  bool bar = false;  // полоса прокрутки справа (для ответов ИИ)
   void openText(const char *path) {
     strlcpy(file, path, sizeof file);
+    bar = false;
     isImage = false;
     page = 0;
     hasNext = false;
@@ -579,6 +595,7 @@ class Reader {
   }
   void openImage(const char *path) {
     strlcpy(file, path, sizeof file);
+    bar = false;
     isImage = true;
     imgOk = false;
     File f = LittleFS.open(file, "r");
@@ -631,6 +648,12 @@ class Reader {
     uint32_t off = 0;
     hasNext = rows == cfg::SCREEN_ROWS && lr.nextLine(line, sizeof line, &off);
     if (hasNext) nextOff = off;
+    if (page > 0 || hasNext) {  // полоса прокрутки справа во всех текстовых файлах
+      uint32_t sz = f.size();
+      int ty = !hasNext ? 54 : sz ? (int)((54UL * pageOff[page]) / sz) : 0;
+      for (int y = 0; y < 64; y += 4) oled.dot(127, y, 1);
+      oled.rect(126, ty, 127, ty + 9, OLED_FILL);
+    }
     f.close();
     if (rows == 0 && page == 0) msg(oled, "Пусто");
   }
@@ -657,6 +680,14 @@ class Reader {
       oled.setCursor(0, rows);
       oled.print(line);
     }
+    // Боковая полоса прокрутки суфлёра: положение бегунка зависит
+    // от текущего смещения в файле, как и в обычном режиме чтения.
+    uint32_t sz = f.size();
+    int ty = sz ? (int)((54ULL * promptOff) / sz) : 0;
+    if (ty > 54) ty = 54;
+    for (int y = 0; y < 64; y += 4) oled.dot(127, y, 1);
+    oled.rect(126, ty, 127, ty + 9, OLED_FILL);
+
     f.close();
     if (rows >= 2) { promptMore = true; promptNext = off; }  // есть вторая строка — можно сдвинуться
   }
@@ -946,6 +977,7 @@ class WebUI {
     server.on("/save", HTTP_POST, [this]() { doSave(); }, [this]() { uploadChunk(); });
     on("/delete", HTTP_POST, &WebUI::doDelete);
     on("/save_wifi", HTTP_POST, &WebUI::doSaveWifi);
+    on("/save_ai", HTTP_POST, &WebUI::doSaveAi);
     on("/save_lefty", HTTP_POST, &WebUI::doSaveLefty);
     on("/save_sleep", HTTP_POST, &WebUI::doSaveSleep);
     on("/save_prompt", HTTP_POST, &WebUI::doSavePrompt);
@@ -1064,7 +1096,8 @@ class WebUI {
       {"err_rmdir", true, "Ошибка при удалении папки!"},
       {"imgname", true, "Ошибка: введите имя файла картинки!"},
       {"imgsize", true, "Ошибка: нужно ровно 1024 байта (128x64), проверьте вставленный код"},
-      {"wifierr", true, "Ошибка: имя сети 1-32 символа, пароль пустой или 8-63 символа!"}};
+      {"wifierr", true, "Ошибка: имя сети 1-32 символа, пароль пустой или 8-63 символа!"},
+      {"aierr", true, "Ошибка: проверьте имя сети (до 32), пароль (до 63), API-ключ и модель"}};
     if (!code || !*code) return;
     for (size_t i = 0; i < sizeof MSGS / sizeof MSGS[0]; i++) {
       if (strcmp(MSGS[i].code, code)) continue;
@@ -1472,6 +1505,22 @@ th.oninput=iv.onchange=go})();</script>)JS");
     o.esc(settings.pass);
     o.raw("'><button type='submit'>Сохранить Wi-Fi</button></form></div>");
 
+    o.raw("<div class='card'><h3>Нейросеть (ProxyAPI)</h3><form method='POST' action='/save_ai'>"
+          "<label class='hint'>Wi-Fi сеть с интернетом для запросов - имя:</label><input type='text' name='sta_ssid' maxlength='32' value='");
+    o.esc(settings.staSsid);
+    o.raw("'><label class='hint'>Пароль этой сети:</label><input type='text' name='sta_pass' maxlength='63' value='");
+    o.esc(settings.staPass);
+    o.raw("'><label class='hint'>API-ключ ProxyAPI:</label><div style='position:relative'>"
+          "<input type='password' id='ak' name='api_key' autocomplete='off' style='padding-right:46px' value='");
+    o.esc(settings.apiKey);
+    o.raw("'><button type='button' style='position:absolute;right:6px;top:8px;width:36px;height:36px;padding:0;background:none;color:var(--txt);font-size:18px;opacity:.5' "
+          "onclick='var i=document.getElementById(\"ak\"),h=i.type==\"password\";i.type=h?\"text\":\"password\";this.style.opacity=h?1:.5'>&#128065;</button></div>"
+          "<label class='hint'>Модель:</label><input type='text' name='model' maxlength='39' value='");
+    o.esc(settings.model);
+    o.raw("'><button type='submit'>Сохранить</button><p class='hint'>");
+    o.raw(settings.aiReady() ? "Готово: в калькуляторе введите 3333." : "Не готово: нужны имя сети и API-ключ.");
+    o.raw("</p></form></div>");
+
     o.raw("<div class='card'><h3>Режим левши</h3><form method='POST' action='/save_lefty'>"
           "<label class='toggle-label'><span>Поворот экрана на 180&deg;</span><input type='checkbox' name='lefty' value='1'");
     if (settings.leftHanded) o.raw(" checked");
@@ -1506,6 +1555,21 @@ th.oninput=iv.onchange=go})();</script>)JS");
     }
     strlcpy(settings.ssid, s.c_str(), sizeof settings.ssid);  
     strlcpy(settings.pass, p.c_str(), sizeof settings.pass);
+    settings.touch(millis());
+    redirectSettings("saved");
+  }
+  void doSaveAi() {
+    String s = server.arg("sta_ssid"), p = server.arg("sta_pass"), k = server.arg("api_key"), m = server.arg("model");
+    s.trim(); k.trim(); m.trim();
+    bool ok = s.length() <= 32 && p.length() <= 63 && k.length() <= 127 && m.length() <= 39;
+    for (size_t i = 0; ok && i < k.length(); i++) ok = (uint8_t)k[i] > 0x20 && (uint8_t)k[i] < 0x7F;
+    for (size_t i = 0; ok && i < m.length(); i++) ok = isalnum((uint8_t)m[i]) || strchr("._:/-", m[i]);
+    for (size_t i = 0; ok && i < s.length(); i++) ok = (uint8_t)s[i] >= 0x20;
+    if (!ok) { redirectSettings("aierr"); return; }
+    strlcpy(settings.staSsid, s.c_str(), sizeof settings.staSsid);
+    strlcpy(settings.staPass, p.c_str(), sizeof settings.staPass);
+    if (k.length()) strlcpy(settings.apiKey, k.c_str(), sizeof settings.apiKey);  // пусто - оставить прежний
+    strlcpy(settings.model, m.length() ? m.c_str() : "openai/gpt-4o-mini", sizeof settings.model);
     settings.touch(millis());
     redirectSettings("saved");
   }
@@ -2088,6 +2152,277 @@ class Mario {
   }
 };
 
+// ---- ИИ: разбор JSON-ответа (без внешних библиотек)
+namespace aijson {
+template <class S> void putUtf8(S &o, uint32_t cp) {
+  if (cp < 0x80) o += (char)cp;
+  else if (cp < 0x800) { o += (char)(0xC0 | (cp >> 6)); o += (char)(0x80 | (cp & 63)); }
+  else if (cp < 0x10000) { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 63)); o += (char)(0x80 | (cp & 63)); }
+  else { o += (char)(0xF0 | (cp >> 18)); o += (char)(0x80 | ((cp >> 12) & 63)); o += (char)(0x80 | ((cp >> 6) & 63)); o += (char)(0x80 | (cp & 63)); }
+}
+inline int hex4(const char *p) {
+  int v = 0;
+  for (int i = 0; i < 4; i++) {
+    if (!isxdigit((uint8_t)p[i])) return -1;
+    v = v * 16 + (p[i] <= '9' ? p[i] - '0' : (p[i] | 0x20) - 'a' + 10);
+  }
+  return v;
+}
+// строковое поле "key":"..." (поиск с позиции from); false, если поля нет или оно не строка
+template <class S> bool str(const char *js, const char *key, S &out, const char *from = nullptr) {
+  char pat[24];
+  snprintf(pat, sizeof pat, "\"%s\"", key);
+  const char *p = strstr(from ? from : js, pat);
+  if (!p) return false;
+  p += strlen(pat);
+  while (*p == ' ' || *p == ':') p++;
+  if (*p != '"') return false;
+  for (p++; *p && *p != '"'; p++) {
+    if (*p != '\\') { out += *p; continue; }
+    p++;
+    switch (*p) {
+      case 0: return true;
+      case 'n': out += '\n'; break;
+      case 't': out += ' '; break;
+      case 'r': case 'b': case 'f': break;
+      case 'u': {
+        int cp = hex4(p + 1);
+        if (cp < 0) break;
+        p += 4;
+        if (cp >= 0xD800 && cp < 0xDC00 && p[1] == '\\' && p[2] == 'u') {  // суррогатная пара
+          int lo = hex4(p + 3);
+          if (lo >= 0xDC00 && lo < 0xE000) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); p += 6; }
+        }
+        putUtf8(out, (uint32_t)cp);
+        break;
+      }
+      default: out += *p;  // \" \\ \/
+    }
+  }
+  return true;
+}
+}  // namespace aijson
+
+// ---- ИИ: экранная клавиатура (РУС / ENG / 123)
+// ▲▼ выбирают строку, ОК заходит в строку; в строке ▲ влево, ▼ вправо, ОК вводит символ и возвращает к выбору строки
+namespace akb {
+const char *const KR[3][3][12] = {
+  {{"й","ц","у","к","е","н","г","ш","щ","з","х",nullptr}, {"ф","ы","в","а","п","р","о","л","д","ж","э",nullptr}, {"я","ч","с","м","и","т","ь","б","ю","ъ","ё",nullptr}},
+  {{"q","w","e","r","t","y","u","i","o","p","-",nullptr}, {"a","s","d","f","g","h","j","k","l","'",":",nullptr}, {"z","x","c","v","b","n","m","!","(",")",nullptr}},
+  {{"1","2","3","4","5","6","7","8","9","0","%",nullptr}, {".",",","?","!",":",";","-","(",")","\"","'",nullptr}, {"+","=","/","*","@","#","$","&","_","<",">",nullptr}}};
+const char *const ML[3] = {"РУС", "ENG", "123"};
+const uint8_t I_SHIFT[5] = {0x08, 0x1C, 0x2A, 0x08, 0x08};
+const uint8_t I_BKSP[5] = {0x10, 0x30, 0x7F, 0x30, 0x10};
+const uint8_t I_ENTER[5] = {0x02, 0x02, 0x22, 0x7E, 0x20};
+}  // namespace akb
+
+class AiKeyboard {
+ public:
+  enum Res { NONE, REDRAW, SEND };
+  void open() { mode = 0; row = 0; inKey = false; memset(mem, 0, sizeof mem); build(); }  // режим по умолчанию - русский
+  void clear() { text[0] = 0; shift = true; cap = false; }
+  const char *query() const { return text; }
+  bool tick(uint32_t now) {  // мигание курсора
+    bool b = (now / 500) & 1;
+    if (b == blink) return false;
+    blink = b;
+    return true;
+  }
+  Res handle(bool u, bool d, bool click) {
+    if (!inKey) {
+      if (u) { row = (row + 3) % 4; return REDRAW; }
+      if (d) { row = (row + 1) % 4; return REDRAW; }
+      if (click) { inKey = true; col = mem[row] < n[row] ? mem[row] : 0; return REDRAW; }
+      return NONE;
+    }
+    if (u) { col = (col + n[row] - 1) % n[row]; return REDRAW; }
+    if (d) { col = (col + 1) % n[row]; return REDRAW; }
+    if (!click) return NONE;
+    mem[row] = col;
+    inKey = false;
+    return act(keys[row][col]);
+  }
+  bool back() {  // отмена выбора клавиши: вернуться к выбору строки (true, если это было нужно)
+    if (!inKey) return false;
+    mem[row] = col;
+    inKey = false;
+    return true;
+  }
+  // Весь текст выводится строго по страницам (кратно 8 px): так буквы не режутся на границах страниц буфера
+  void draw(Oled &o) const {
+    int len = u8::length(text), tr = len / 21 + 1, r0 = tr > 3 ? tr - 3 : 0;
+    char b[96];
+    for (int i = 0; i < 3 && r0 + i < tr; i++) {
+      u8::copy(b, sizeof b, text, (r0 + i) * 21, 21);
+      o.setCursor(0, i);
+      o.print(b);
+    }
+    if (blink) { int cx = (len % 21) * 6, cy = (len / 21 - r0) * 8 + 7; o.rect(cx, cy, cx + 4, cy, OLED_FILL); }
+    o.rect(0, 28, 127, 28, OLED_FILL);
+    for (int r = 0; r < 4; r++) {
+      int ry = 32 + r * 8;  // страницы 4..7, нижний ряд ровно у края экрана
+      for (int i = 0; i < n[r]; i++) drawKey(o, keys[r][i], ry, inKey && r == row && i == col);
+      if (!inKey && r == row) {  // выбранная строка: маркеры по краям
+        o.rect(0, ry, 1, ry + 7, OLED_FILL);
+        o.rect(126, ry, 127, ry + 7, OLED_FILL);
+      }
+    }
+  }
+
+ private:
+  enum { K_CH, K_MODE, K_SHIFT, K_SPACE, K_BKSP, K_ENTER };
+  struct K { uint8_t act; const char *s; uint8_t x, w; };
+  K keys[4][12];
+  uint8_t n[4] = {0, 0, 0, 0}, mem[4] = {0, 0, 0, 0};
+  char text[cfg::AI_Q_BYTES + 1] = {0};
+  int mode = 0, row = 0, col = 0;
+  bool inKey = false, shift = true, cap = false, blink = false;
+
+  static bool isLetter(const char *s) {
+    uint8_t a = (uint8_t)s[0];
+    return ((a | 0x20) >= 'a' && (a | 0x20) <= 'z') || a == 0xD0 || a == 0xD1;
+  }
+  static void upper(char *d, const char *s) {  // строчная буква (латиница/кириллица) -> заглавная
+    uint8_t a = (uint8_t)s[0], b = (uint8_t)s[1];
+    if (a >= 'a' && a <= 'z') { d[0] = (char)(a - 32); d[1] = 0; }
+    else if (a == 0xD0 && b >= 0xB0 && b <= 0xBF) { d[0] = (char)0xD0; d[1] = (char)(b - 0x20); d[2] = 0; }
+    else if (a == 0xD1 && b >= 0x80 && b <= 0x8F) { d[0] = (char)0xD0; d[1] = (char)(b + 0x20); d[2] = 0; }
+    else if (a == 0xD1 && b == 0x91) { d[0] = (char)0xD0; d[1] = (char)0x81; d[2] = 0; }
+    else strlcpy(d, s, 4);
+  }
+  void build() {
+    for (int r = 0; r < 3; r++) {
+      n[r] = 0;
+      for (int i = 0; akb::KR[mode][r][i]; i++) { keys[r][i] = {K_CH, akb::KR[mode][r][i], (uint8_t)(3 + i * 11), 10}; n[r]++; }
+    }
+    struct C { uint8_t act; const char *s; uint8_t w; };
+    static const C L[] = {{K_MODE, "", 21}, {K_SHIFT, "", 11}, {K_SPACE, "", 22}, {K_CH, ".", 9}, {K_CH, ",", 9}, {K_CH, "?", 9}, {K_BKSP, "", 15}, {K_ENTER, "", 17}};
+    static const C S[] = {{K_MODE, "", 21}, {K_SPACE, "", 68}, {K_BKSP, "", 30}};  // в символах кнопки "ввод" нет
+    const C *c = mode == 2 ? S : L;
+    n[3] = mode == 2 ? 3 : 8;
+    int x = 4;
+    for (int i = 0; i < n[3]; i++) { keys[3][i] = {c[i].act, c[i].s, (uint8_t)x, c[i].w}; x += c[i].w + 1; }
+  }
+  void append(const char *s) {
+    size_t l = strlen(text), k = strlen(s);
+    if (l + k <= (size_t)cfg::AI_Q_BYTES) { memcpy(text + l, s, k + 1); }
+  }
+  Res act(const K &k) {
+    switch (k.act) {
+      case K_CH: {
+        bool letter = isLetter(k.s);
+        char t[4];
+        if (shift && letter) upper(t, k.s); else strlcpy(t, k.s, 4);
+        append(t);
+        if (letter) { shift = false; cap = false; }
+        if (k.s[0] == '.' || k.s[0] == '!' || k.s[0] == '?') cap = true;  // после конца предложения - заглавная
+        break;
+      }
+      case K_SPACE: append(" "); if (cap) { shift = true; cap = false; } break;
+      case K_SHIFT: shift = !shift; break;
+      case K_MODE: mode = (mode + 1) % 3; row = 0; memset(mem, 0, sizeof mem); build(); break;
+      case K_BKSP: {
+        size_t l = strlen(text);
+        if (l) { do l--; while (l && u8::isCont((uint8_t)text[l])); text[l] = 0; }
+        if (!text[0]) { shift = true; cap = false; }
+        break;
+      }
+      case K_ENTER:
+        for (const char *p = text; *p; p++) if (*p != ' ') return SEND;
+        return NONE;
+    }
+    return REDRAW;
+  }
+  void drawKey(Oled &o, const K &k, int ry, bool sel) const {
+    int x = k.x, w = k.w, ix = x + (w - 7) / 2, col2 = sel ? OLED_CLEAR : OLED_FILL;
+    if (sel) {  // плашка со срезанными углами
+      o.rect(x + 1, ry, x + w - 2, ry + 7, OLED_FILL);
+      o.rect(x, ry + 1, x + w - 1, ry + 6, OLED_FILL);
+    } else if (k.act == K_SHIFT && shift) o.rect(x + 1, ry + 7, x + w - 2, ry + 7, OLED_FILL);  // регистр включён - подчёркивание
+    const uint8_t *ic = nullptr;
+    char t[4];
+    const char *s = nullptr;
+    switch (k.act) {
+      case K_CH: upper(t, k.s); s = t; break;
+      case K_MODE: s = akb::ML[mode]; break;
+      case K_SHIFT: ic = akb::I_SHIFT; break;
+      case K_BKSP: ic = akb::I_BKSP; break;
+      case K_ENTER: ic = akb::I_ENTER; break;
+      case K_SPACE:
+        o.rect(x + 4, ry + 5, x + w - 5, ry + 5, col2);
+        o.dot(x + 4, ry + 4, col2); o.dot(x + w - 5, ry + 4, col2);
+        break;
+    }
+    if (ic) for (int r = 0; r < 5; r++) for (int c = 0; c < 7; c++) if (ic[r] & (0x40 >> c)) o.dot(ix + c, ry + 1 + r, col2);
+    if (s) {
+      if (sel) o.invertText(true);
+      o.setCursor(x + (w - 6 * u8::length(s)) / 2, ry / 8);
+      o.print(s);
+      if (sel) o.invertText(false);
+    }
+  }
+};
+
+// ---- Единое меню (калькулятор: 0000): вкладки ИГРЫ / НЕЙРО / ФУНКЦИИ, иконки, переключатели, подсказка
+class Hub {
+ public:
+  enum Item { FLAPPY, TETRIS, MARIO, AI, FLIP, RGB, RGBPIN, DELETE, COUNT };
+  struct Info { bool flip, rgb, pin, aiOk; int bF, bT, bM; };
+  void open() { sel = 0; }
+  void move(int d) { sel = (sel + d + COUNT) % COUNT; }
+  int selected() const { return sel; }
+  void draw(Oled &o, const Info &in) const {
+    static const char *const TAB[3] = {"ИГРЫ", "НЕЙРО", "ФУНКЦИИ"};
+    static const uint8_t TX[3] = {0, 35, 76}, TW[3] = {34, 40, 52}, FIRST[3] = {FLAPPY, AI, FLIP}, CNT[3] = {3, 1, 4};
+    static const char *const LBL[COUNT] = {"Flappy Bird", "Tetris", "Super Mario", "Чат с ИИ", "Поворот 180", "RGB подсветка", "Закреплять RGB", "Удалить файлы"};
+    static const uint8_t IC[COUNT][7] = {
+      {0x1C, 0x3E, 0x7A, 0x7F, 0x3E, 0x1C, 0x00},  // птица
+      {0x60, 0x60, 0x7E, 0x1E, 0x1E, 0x06, 0x06},  // фигуры
+      {0x1C, 0x3E, 0x6B, 0x7F, 0x1C, 0x1C, 0x1C},  // гриб
+      {0x7F, 0x41, 0x55, 0x41, 0x7F, 0x30, 0x20},  // облачко чата
+      {0x08, 0x1C, 0x3E, 0x00, 0x3E, 0x1C, 0x08},  // перевернуть
+      {0x08, 0x2A, 0x1C, 0x77, 0x1C, 0x2A, 0x08},  // свет
+      {0x1C, 0x22, 0x22, 0x7F, 0x77, 0x77, 0x7F},  // замок
+      {0x1C, 0x7F, 0x22, 0x2A, 0x2A, 0x22, 0x3E}}; // корзина
+    const int sec = sel <= MARIO ? 0 : sel == AI ? 1 : 2;
+    for (int t = 0; t < 3; t++) {  // вкладки разделов
+      int x = TX[t], w = TW[t], tx = x + (w - 6 * u8::length(TAB[t])) / 2;
+      if (t == sec) { o.rect(x + 1, 0, x + w - 2, 7, OLED_FILL); o.rect(x, 1, x + w - 1, 7, OLED_FILL); o.invertText(true); }
+      o.setCursor(tx, 0);
+      o.print(TAB[t]);
+      o.invertText(false);
+    }
+    o.rect(0, 11, 127, 11, OLED_FILL);
+    for (int k = 0; k < CNT[sec]; k++) {  // пункты раздела: страницы 2..5
+      int it = FIRST[sec] + k, page = 2 + k, y = page * 8;
+      bool s = it == sel;
+      int col = s ? OLED_CLEAR : OLED_FILL;
+      if (s) { o.rect(1, y, 126, y + 7, OLED_FILL); o.rect(0, y + 1, 127, y + 6, OLED_FILL); o.invertText(true); }
+      for (int r = 0; r < 7; r++) for (int c = 0; c < 7; c++) if (IC[it][r] & (0x40 >> c)) o.dot(3 + c, y + r, col);
+      o.setCursor(14, page);
+      o.print(LBL[it]);
+      if (it <= MARIO) {  // рекорд справа
+        char b[12];
+        snprintf(b, sizeof b, "%d", it == FLAPPY ? in.bF : it == TETRIS ? in.bT : in.bM);
+        o.setCursor(124 - 6 * (int)strlen(b), page);
+        o.print(b);
+      }
+      o.invertText(false);
+      if (it >= FLIP && it <= RGBPIN) {  // переключатель
+        bool on = it == FLIP ? in.flip : it == RGB ? in.rgb : in.pin;
+        int x0 = 111, ky = y + 2;
+        o.rect(x0 + 1, y, x0 + 11, y, col); o.rect(x0 + 1, y + 6, x0 + 11, y + 6, col);
+        o.rect(x0, y + 1, x0, y + 5, col); o.rect(x0 + 12, y + 1, x0 + 12, y + 5, col);
+        if (on) { o.rect(x0 + 1, y + 1, x0 + 11, y + 5, col); o.rect(x0 + 8, ky, x0 + 10, ky + 2, s ? OLED_FILL : OLED_CLEAR); }
+        else o.rect(x0 + 2, ky, x0 + 4, ky + 2, col);
+      }
+    }
+  }
+
+ private:
+  int sel = 0;
+};
+
 class App : public WebHooks {
  public:
   App() : web(settings, files, *this) {}
@@ -2147,6 +2482,7 @@ class App : public WebHooks {
       if (mario.tick(now)) draw();
       if (mario.best > settings.marBest) { settings.marBest = mario.best; settings.touch(now); }
     }
+    if (state == ST_AIKB && kb.tick(now)) draw();  // мигающий курсор
     if (state == ST_PROMPT) {
       lastActivity = now;  // во время суфлёра не засыпаем
       if (!promptPaused && now - promptLast >= (uint32_t)settings.promptCs * 10UL) {
@@ -2165,7 +2501,7 @@ class App : public WebHooks {
   void sleepChanged() override { lastActivity = millis(); }
 
  private:
-  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_FLAPPY, ST_TETRIS, ST_PROMPT, ST_MARIO };
+  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_FLAPPY, ST_TETRIS, ST_PROMPT, ST_MARIO, ST_AIKB, ST_HUB };
 
   Oled oled;
   Settings settings;
@@ -2175,6 +2511,11 @@ class App : public WebHooks {
   FlappyBird flappy;
   Tetris tetris;
   Mario mario;
+  AiKeyboard kb;
+  Hub hub;
+  bool aiAnswer = false, aiSaved = false;  // показан ответ ИИ / он уже сохранён в файлы
+  bool backHub = false;  // запуск из меню 0000: выход возвращает в меню
+  bool aiView = false;  // после ответа ИИ вернуться к клавиатуре
   WebUI web;
   Button up, down, ok;
   State state = ST_LIST;
@@ -2217,6 +2558,8 @@ class App : public WebHooks {
       case ST_FLAPPY: flappy.draw(oled); break;
       case ST_TETRIS: tetris.draw(oled); break;
       case ST_MARIO: mario.draw(oled); break;
+      case ST_AIKB: kb.draw(oled); break;
+      case ST_HUB: hub.draw(oled, Hub::Info{settings.leftHanded, rgbOn, settings.rgbBoot, settings.aiReady(), settings.best, settings.tetBest, settings.marBest}); break;
       case ST_VIEW: case ST_PROMPT: reader.draw(oled); break;
       case ST_WIFI: drawWifiInfo(); break;
       case ST_CALC: calc.draw(oled); break;
@@ -2249,55 +2592,31 @@ class App : public WebHooks {
   }
 
   // секретные коды калькулятора (без WiFi)
+  State exitTarget() { return backHub ? ST_HUB : web.active() ? ST_WIFI : ST_LIST; }
+
+  void runHub(int id) {
+    backHub = true;
+    switch (id) {
+      case Hub::FLAPPY: flappy.best = settings.best; flappy.reset(); state = ST_FLAPPY; break;
+      case Hub::TETRIS: tetris.best = settings.tetBest; tetris.reset(); state = ST_TETRIS; break;
+      case Hub::MARIO: mario.best = settings.marBest; mario.start(); state = ST_MARIO; break;
+      case Hub::AI:
+        if (!settings.aiReady()) showText("ИИ", "ИИ не настроен. Зажмите ОК в списке файлов, подключитесь к Wi-Fi устройства, откройте 192.168.4.1/settings и заполните: имя сети с интернетом, пароль и API-ключ ProxyAPI.", false);
+        else { kb.clear(); kb.open(); state = ST_AIKB; }
+        break;
+      case Hub::FLIP: settings.leftHanded = !settings.leftHanded; applyOrientation(); settings.touch(millis()); break;
+      case Hub::RGB: rgbOn = !rgbOn; if (!rgbOn) neopixelWrite(cfg::PIN_RGB, 0, 0, 0); break;
+      case Hub::RGBPIN: settings.rgbBoot = !settings.rgbBoot; settings.touch(millis()); if (settings.rgbBoot) rgbOn = true; break;
+      case Hub::DELETE: backHub = false; files.beginMark(); state = ST_MARK; break;
+    }
+  }
+
   bool secretCode(const char *c) {
-    if (!strcmp(c, "1111")) {  // разворот экрана на 180°
-      settings.leftHanded = !settings.leftHanded;
-      applyOrientation();
-      settings.touch(millis());
+    backHub = false;
+    if (!strcmp(c, "0000")) {  // единое меню: игры, нейросеть, функции
       calc.reset();
-      return true;
-    }
-    if (!strcmp(c, "0000")) {  // Flappy Bird
-      calc.reset();
-      flappy.best = settings.best;
-      flappy.reset();
-      state = ST_FLAPPY;
-      return true;
-    }
-    if (!strcmp(c, "0001")) {  // Tetris
-      calc.reset();
-      tetris.best = settings.tetBest;
-      tetris.reset();
-      state = ST_TETRIS;
-      return true;
-    }
-    if (!strcmp(c, "0002")) {  // Super Mario
-      calc.reset();
-      mario.best = settings.marBest;
-      mario.start();
-      state = ST_MARIO;
-      return true;
-    }
-    if (!strcmp(c, "0101")) {  // подсветка вкл/выкл (после перезагрузки сбрасывается)
-      calc.reset();
-      rgbOn = !rgbOn;
-      if (!rgbOn) neopixelWrite(cfg::PIN_RGB, 0, 0, 0);
-      return true;
-    }
-    if (!strcmp(c, "1010")) {  // закрепить подсветку после выключения (вкл/выкл), вспышка: зелёная - закреплено, красная - снято
-      calc.reset();
-      settings.rgbBoot = !settings.rgbBoot;
-      settings.touch(millis());
-      if (settings.rgbBoot) rgbOn = true;
-      neopixelWrite(cfg::PIN_RGB, settings.rgbBoot ? 0 : 64, settings.rgbBoot ? 64 : 0, 0);
-      delay(300);
-      neopixelWrite(cfg::PIN_RGB, 0, 0, 0);
-      return true;
-    }
-    if (!strcmp(c, "2222")) {  // режим удаления
-      calc.reset();
-      files.beginMark();
-      state = ST_MARK;
+      hub.open();
+      state = ST_HUB;
       return true;
     }
     return false;
@@ -2351,7 +2670,7 @@ class App : public WebHooks {
         tetris.fast = false;
         bothHeld = false;
         justWoke = true;  // дождаться отпускания кнопок, чтобы не открылся калькулятор
-        state = web.active() ? ST_WIFI : ST_LIST; draw();
+        state = exitTarget(); draw();
         return;
       }
     }
@@ -2361,7 +2680,40 @@ class App : public WebHooks {
       if (ok.pressed) mario.jump();
       return;
     }
+    if (state == ST_HUB) {  // меню 0000: ▲▼ выбор, ОК действие, зажать ОК - выход
+      Button &nu = settings.leftHanded ? down : up, &nd = settings.leftHanded ? up : down;
+      if (ok.longPress) { state = web.active() ? ST_WIFI : ST_LIST; draw(); return; }
+      if (nu.pressed || nu.repeat) { hub.move(-1); draw(); }
+      if (nd.pressed || nd.repeat) { hub.move(1); draw(); }
+      if (ok.released && !ok.longFired) { runHub(hub.selected()); draw(); }
+      return;
+    }
+    if (state == ST_AIKB) {  // клавиатура ИИ: ▲▼ выбор, ОК ввод, зажать ОК - выход
+      Button &nu = settings.leftHanded ? down : up, &nd = settings.leftHanded ? up : down;
+      if (ok.longPress) {  // зажать ОК: на клавише - отмена выбора (назад к строкам), на выборе строки - выход из ИИ
+        if (kb.back()) draw();
+        else { state = exitTarget(); draw(); }
+        return;
+      }
+      AiKeyboard::Res r = kb.handle(nu.pressed || nu.repeat, nd.pressed || nd.repeat, ok.released && !ok.longFired);
+      if (r == AiKeyboard::SEND) { aiAsk(kb.query()); lastActivity = millis(); draw(); }
+      else if (r == AiKeyboard::REDRAW) draw();
+      return;
+    }
     if (up.stable && down.stable) {  // обе кнопки дольше 0.4 с - калькулятор
+      if (state == ST_VIEW && reader.bar && aiAnswer) {  // ответ ИИ: обе кнопки ~0.6 с - сохранить в файлы
+        if (!bothHeld) { bothHeld = true; bothDone = false; bothSince = now; }
+        else if (!bothDone && now - bothSince > 600) {
+          bothDone = true;
+          char t[40];
+          if (aiSaved) drawStatus("Уже сохранено", "в файлах", 1);
+          else if (saveAi(t, sizeof t)) { aiSaved = true; drawStatus("Сохранено", t, 1); }
+          else drawStatus("Не удалось", "нет места", 1);
+          delay(900);
+          draw();
+        }
+        return;
+      }
       if (state == ST_TETRIS) {  // в тетрисе обе кнопки = ускорение падения в 3 раза
         if (!bothHeld) { bothHeld = true; tetris.chordStart(now); }
         return;
@@ -2388,7 +2740,7 @@ class App : public WebHooks {
         if (ok.longPress) toggleWifi();
         break;
       case ST_VIEW:
-        if (navUp.pressed) promptArm = reader.canPrompt();  // нажатие НАЧАЛОСЬ на первой странице?
+        if (navUp.pressed) promptArm = !reader.bar && reader.canPrompt();  // нажатие НАЧАЛОСЬ на первой странице?
         if (navUp.longPress && promptArm) {  // ▲ зажата на первой странице — запуск суфлёра
           promptArm = false;
           reader.promptStart();
@@ -2400,7 +2752,8 @@ class App : public WebHooks {
         }
         if (upStep && reader.prev()) draw();
         if (downStep && reader.next()) draw();
-        if (ok.released && !ok.longFired) { state = ST_LIST; draw(); }
+        if (reader.bar && ok.longPress) { state = exitTarget(); draw(); break; }  // ИИ: зажать ОК - выход
+        if (ok.released && !ok.longFired) { state = reader.bar ? (aiView ? ST_AIKB : exitTarget()) : ST_LIST; draw(); }
         break;
       case ST_PROMPT:
         if (navUp.pressed) { promptPaused = !promptPaused; promptLast = now; }  // пауза / продолжить
@@ -2467,6 +2820,149 @@ class App : public WebHooks {
     reader.promptStop();
     state = ST_VIEW;  // страница та же, что была до суфлёра
     draw();
+  }
+
+  // ---- ИИ: ProxyAPI (OpenAI-совместимый /chat/completions)
+  void drawStatus(const char *a, const char *b, int step) {
+    oled.clear();
+    oled.rect(6, 12, 121, 51, OLED_STROKE);
+    oled.setCursor((128 - u8::length(a) * 6) / 2, 2); oled.print(a);
+    oled.setCursor((128 - u8::length(b) * 6) / 2, 3); oled.print(b);
+    for (int i = 0; i < 3; i++) oled.rect(49 + i * 10, 38, 52 + i * 10, 41, i == step % 3 ? OLED_FILL : OLED_STROKE);
+    oled.update();
+  }
+
+  // ответ/ошибка/уведомление: пишем во временный файл и показываем читалкой (листание страниц как в шпаргалках)
+  void showText(const char *title, const String &body, bool backToKb) {
+    aiAnswer = false;
+    File f = LittleFS.open(cfg::AI_PATH, "w");
+    if (f) { f.print(title); f.print('\n'); f.print(body); f.close(); }
+    reader.openText(cfg::AI_PATH);
+    reader.bar = true;  // полоса прокрутки справа
+    aiView = backToKb;
+    state = ST_VIEW;
+  }
+
+  // сохранить ответ ИИ в файлы: "Ответ от ИИ", затем "Ответ от ИИ (1)", "(2)" ...
+  bool saveAi(char *title, size_t cap) {
+    File in = LittleFS.open(cfg::AI_PATH, "r");
+    if (!in) return false;
+    in.readStringUntil('\n');  // пропустить служебный заголовок
+    if (!fsx::hasSpace((long)in.size() + 80)) { in.close(); return false; }
+    static const char P[] = "Ответ от ИИ (";
+    bool base = false;
+    int maxN = 0;
+    unsigned long maxId = 0;
+    fsx::scanDir("/", [&](const char *p, File &f) {
+      if (f.isDirectory()) return;
+      const char *name = str::baseName(p);
+      if (!strncmp(name, "d_", 2)) { unsigned long id = strtoul(name + 2, nullptr, 10); if (id > maxId) maxId = id; }
+      char t[40];
+      int n = f.readBytesUntil('\n', t, sizeof t - 1);
+      t[n > 0 ? n : 0] = 0;
+      if (n > 0 && t[n - 1] == '\r') t[n - 1] = 0;
+      if (!strcmp(t, "Ответ от ИИ")) base = true;
+      else if (!strncmp(t, P, sizeof P - 1)) { int k = atoi(t + sizeof P - 1); if (k > maxN) maxN = k; }
+    });
+    if (!base) strlcpy(title, "Ответ от ИИ", cap);
+    else snprintf(title, cap, "Ответ от ИИ (%d)", maxN + 1);
+    char path[32];
+    snprintf(path, sizeof path, "/d_%lu.txt", maxId + 1);
+    File out = LittleFS.open(path, "w");
+    if (!out) { in.close(); return false; }
+    out.print(title);
+    out.print('\n');
+    uint8_t buf[128];
+    int n;
+    while ((n = in.read(buf, sizeof buf)) > 0) out.write(buf, n);
+    out.close();
+    in.close();
+    files.refresh();
+    return true;
+  }
+
+  void aiDisconnect(bool apWas) {
+    if (apWas) WiFi.disconnect(false);  // точка доступа настроек продолжает работать
+    else { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
+  }
+
+  void aiAsk(const char *q) {
+    const bool apWas = web.active();
+    drawStatus("Подключение", "к Wi-Fi", 0);
+    WiFi.mode(apWas ? WIFI_AP_STA : WIFI_STA);
+    WiFi.begin(settings.staSsid, settings.staPass[0] ? settings.staPass : nullptr);
+    uint32_t t0 = millis(), tDot = t0;
+    int step = 0;
+    bool cancel = false;
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+      delay(50);
+      rgbTick(millis());
+      if (millis() - tDot >= 300) { tDot = millis(); drawStatus("Подключение", "к Wi-Fi", ++step); }
+      if (!digitalRead(cfg::PIN_UP) || !digitalRead(cfg::PIN_DOWN) || !digitalRead(cfg::PIN_OK)) { cancel = true; break; }  // любая кнопка - отмена
+    }
+    if (cancel || WiFi.status() != WL_CONNECTED) {
+      aiDisconnect(apWas);
+      justWoke = true;  // дождаться отпускания кнопок
+      if (!cancel) showText("Ошибка ИИ", String("Не удалось подключиться к сети \"") + settings.staSsid + "\". Проверьте имя и пароль в веб-настройках.", true);
+      return;
+    }
+    drawStatus("Запрос к ИИ", "ждите ответ", 1);
+    String body;
+    body.reserve(strlen(q) + 400);
+    // ProxyAPI принимает OpenAI Chat Completions на /v1/chat/completions.
+    // Для короткого имени явно добавляем вендора OpenAI.
+    String modelId = settings.model;
+    if (modelId.indexOf('/') < 0) modelId = String("openai/") + modelId;
+    body += "{\"model\":\""; body += modelId;
+    body += "\",\"max_tokens\":600,\"messages\":[{\"role\":\"system\",\"content\":\"Ты помощник на маленьком OLED-экране. Отвечай кратко и по делу на языке вопроса, простым текстом: без markdown, без звёздочек, без эмодзи.\"},{\"role\":\"user\",\"content\":\"";
+    for (const char *p = q; *p; p++) {
+      const uint8_t c = (uint8_t)*p;
+      if (*p == '"' || *p == '\\') { body += '\\'; body += *p; }
+      else if (c == '\n') body += "\\n";
+      else if (c == '\r') body += "\\r";
+      else if (c == '\t') body += "\\t";
+      else if (c >= 0x20) body += *p;
+      else body += ' ';
+    }
+    body += "\"}]}";
+    WiFiClientSecure cli;
+    cli.setInsecure();  // без проверки сертификата (экономит память и не требует хранить корневые сертификаты)
+    HTTPClient http;
+    http.setConnectTimeout(10000);
+    http.setTimeout(30000);
+    String resp;
+    int code = -1;
+    if (http.begin(cli, "https://api.proxyapi.ru/v1/chat/completions")) {
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("Authorization", String("Bearer ") + settings.apiKey);
+      code = http.POST(body);
+      if (code > 0) resp = http.getString();
+      http.end();
+    }
+    aiDisconnect(apWas);
+    String ans;
+    if (code == 200 && aijson::str(resp.c_str(), "content", ans, strstr(resp.c_str(), "\"message\"")) && ans.length()) {
+      kb.clear();
+      showText("Ответ ИИ", ans, true);
+      aiAnswer = true; aiSaved = false;
+      return;
+    }
+    String e, m;
+    aijson::str(resp.c_str(), "message", e);
+    if (code <= 0) m = "Нет связи с сервером ProxyAPI. Проверьте интернет (код " + String(code) + ").";
+    else if (code == 401) m = "Неверный API-ключ (401).";
+    else if (code == 402) m = "Недостаточно средств на балансе ProxyAPI (402).";
+    else if (code == 429) m = "Слишком много запросов (429), подождите немного.";
+    else if (code == 200) m = "Пустой ответ от ИИ.";
+    else m = "Ошибка сервера, код " + String(code) + ".";
+    if (e.length()) { m += "\n"; m += e; }
+    // ProxyAPI возвращает подробности ошибки в JSON; покажем тело ответа,
+    // если поле message не удалось извлечь нашим компактным JSON-парсером.
+    if (code >= 400 && !resp.isEmpty() && e.isEmpty()) {
+      m += "\nОтвет API: ";
+      m += resp.substring(0, 220);
+    }
+    showText("Ошибка ИИ", m, true);
   }
 
   void openSelected() {
