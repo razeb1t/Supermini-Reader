@@ -17,6 +17,12 @@
 
 namespace cfg {
 constexpr uint8_t PIN_SDA = 11, PIN_SCL = 13, PIN_UP = 5, PIN_DOWN = 7, PIN_OK = 6, PIN_RGB = 48;  // PIN_RGB - встроенный WS2812 на ESP32-S3 SuperMini
+constexpr uint8_t PIN_BAT = 2;         // делитель аккумулятора (ADC1)
+constexpr float BAT_RATIO = 2.0f;      // делитель 1:1; подстройка по мультиметру: 2.0 -> 2.03 и т.п.
+constexpr int BAT_MAH = 350;           // ёмкость аккумулятора
+constexpr float BAT_MIN_OK = 3.0f, BAT_MAX_OK = 4.4f;  // замеры вне диапазона (заряд, выключатель) игнорируются
+constexpr uint32_t BAT_WIN_S[] = {10, 30, 60};         // окна усреднения, с (последнее повторяется)
+constexpr const char *BAT_PATH = "/_batt.txt";         // последнее показанное напряжение
 constexpr int SCREEN_ROWS = 8;         // строк текста на экране
 constexpr int CHARS_PER_LINE = 21;     // символов в строке
 constexpr int PATH_LEN = 128;          // макс. длина пути в байтах (кириллица = 2 байта на букву)
@@ -29,6 +35,8 @@ constexpr uint32_t SCROLL_MS = 300;    // скорость бегущей стр
 constexpr uint32_t SAVE_DELAY_MS = 800;
 constexpr const char *SETTINGS_PATH = "/_cfg.txt";
 constexpr const char *AI_PATH = "/_ai.txt";  // временный файл с ответом ИИ
+constexpr int AI_HIST_N = 10;                // пар вопрос/ответ в памяти чата
+constexpr size_t AI_HIST_BYTES = 75000;      // макс. объём истории, байт
 constexpr int AI_Q_BYTES = 240;              // макс. длина вопроса к ИИ в байтах
 }  
 
@@ -122,7 +130,7 @@ template <class Fn> void scanDir(const char *dir, Fn fn) {
   while (f) {
     const char *p = f.path();
     if (!p || !*p) { snprintf(tmp, sizeof tmp, "%s%s", dir, f.name()); p = tmp; }
-    if (!strstr(p, cfg::SETTINGS_PATH + 1) && !strstr(p, "_up.tmp") && !strstr(p, "_ai.txt")) fn(p, f);
+    if (!strstr(p, cfg::SETTINGS_PATH + 1) && !strstr(p, "_up.tmp") && !strstr(p, "_ai.txt") && !strstr(p, "_batt.txt")) fn(p, f);
     f = root.openNextFile();
   }
 }
@@ -814,13 +822,14 @@ class FileBrowser {
 
   bool tickScroll(uint32_t now) {
     if (n == 0 || sel >= n || now - scrollAt <= cfg::SCROLL_MS) return false;
-    if (u8::length(items[sel].title) <= WIDTH) return false;
+    if (u8::length(items[sel].title) <= WIDTH - (sel == top ? trim0 : 0)) return false;
     scrollAt = now;
     scrollPos++;
     return true;
   }
 
-  void draw(Oled &oled) {
+  void draw(Oled &oled, int trim = 0) {  // trim - сколько символов освободить справа в первой строке (индикатор заряда)
+    trim0 = trim;
     if (n == 0) { oled.setCursor(0, 3); oled.print("Нет файлов"); return; }
     const int VIS = cfg::SCREEN_ROWS, MARGIN = 1;
     if (sel < top + MARGIN) top = sel - MARGIN > 0 ? sel - MARGIN : 0;
@@ -830,14 +839,15 @@ class FileBrowser {
     for (int row = 0; row < VIS && top + row < n; row++) {
       int idx = top + row;
       const char *title = items[idx].title;
-      if (u8::length(title) <= WIDTH) strlcpy(shown, title, sizeof shown);
-      else if (idx == sel) marquee(shown, sizeof shown, title, scrollPos);
-      else u8::copy(shown, sizeof shown, title, 0, WIDTH);
+      const int w = row == 0 ? WIDTH - trim0 : WIDTH;
+      if (u8::length(title) <= w) strlcpy(shown, title, sizeof shown);
+      else if (idx == sel) marquee(shown, sizeof shown, title, scrollPos, w);
+      else u8::copy(shown, sizeof shown, title, 0, w);
       snprintf(line, sizeof line, "%s%s", idx == sel ? "> " : "  ", shown);
       oled.setCursor(0, row);
       if (markMode && isMarked(items[idx].path)) {  // инверсия всей строки
         size_t l = strlen(line);
-        for (int k = u8::length(line); k < cfg::CHARS_PER_LINE && l + 1 < sizeof line; k++) line[l++] = ' ';
+        for (int k = u8::length(line); k < cfg::CHARS_PER_LINE - (row == 0 ? trim0 : 0) && l + 1 < sizeof line; k++) line[l++] = ' ';
         line[l] = 0;
         oled.invertText(true);
         oled.print(line);
@@ -852,7 +862,7 @@ class FileBrowser {
   char marks[cfg::MAX_MARKS][cfg::PATH_LEN];
   enum { WIDTH = cfg::CHARS_PER_LINE - 2 };
   Entry items[cfg::MAX_FILES];
-  int n = 0, sel = 0, top = 0, scrollPos = 0;
+  int n = 0, sel = 0, top = 0, scrollPos = 0, trim0 = 0;
   uint32_t scrollAt = 0;
   char dir[cfg::PATH_LEN + 2];
 
@@ -865,11 +875,11 @@ class FileBrowser {
     e.isDir = isDir;
     e.isImage = isImage;
   }
-  static void marquee(char *out, size_t cap, const char *title, int pos) {
+  static void marquee(char *out, size_t cap, const char *title, int pos, int w) {
     char loop[cfg::TITLE_LEN * 2 + 8];
     snprintf(loop, sizeof loop, "%s    %s", title, title);
     int period = u8::length(title) + 4;
-    u8::copy(out, cap, loop, pos % period, WIDTH);
+    u8::copy(out, cap, loop, pos % period, w);
   }
 };
 
@@ -2366,25 +2376,27 @@ class AiKeyboard {
 // ---- Единое меню (калькулятор: 0000): вкладки ИГРЫ / НЕЙРО / ФУНКЦИИ, иконки, переключатели, подсказка
 class Hub {
  public:
-  enum Item { FLAPPY, TETRIS, MARIO, AI, FLIP, RGB, RGBPIN, DELETE, COUNT };
+  enum Item { FLAPPY, TETRIS, MARIO, AI, AIMEM, FLIP, RGB, RGBPIN, VOLT, DELETE, COUNT };
   struct Info { bool flip, rgb, pin, aiOk; int bF, bT, bM; };
   void open() { sel = 0; }
   void move(int d) { sel = (sel + d + COUNT) % COUNT; }
   int selected() const { return sel; }
   void draw(Oled &o, const Info &in) const {
     static const char *const TAB[3] = {"ИГРЫ", "НЕЙРО", "ФУНКЦИИ"};
-    static const uint8_t TX[3] = {0, 35, 76}, TW[3] = {34, 40, 52}, FIRST[3] = {FLAPPY, AI, FLIP}, CNT[3] = {3, 1, 4};
-    static const char *const LBL[COUNT] = {"Flappy Bird", "Tetris", "Super Mario", "Чат с ИИ", "Поворот 180", "RGB подсветка", "Закреплять RGB", "Удалить файлы"};
+    static const uint8_t TX[3] = {0, 35, 76}, TW[3] = {34, 40, 52}, FIRST[3] = {FLAPPY, AI, FLIP}, CNT[3] = {3, 2, 5};
+    static const char *const LBL[COUNT] = {"Flappy Bird", "Tetris", "Super Mario", "Чат без памяти", "Чат с памятью", "Поворот 180", "RGB подсветка", "Закреплять RGB", "Напряжение", "Удалить файлы"};
     static const uint8_t IC[COUNT][7] = {
       {0x1C, 0x3E, 0x7A, 0x7F, 0x3E, 0x1C, 0x00},  // птица
       {0x60, 0x60, 0x7E, 0x1E, 0x1E, 0x06, 0x06},  // фигуры
       {0x1C, 0x3E, 0x6B, 0x7F, 0x1C, 0x1C, 0x1C},  // гриб
       {0x7F, 0x41, 0x55, 0x41, 0x7F, 0x30, 0x20},  // облачко чата
+      {0x7F, 0x41, 0x5D, 0x41, 0x7F, 0x30, 0x20},  // облачко с памятью
       {0x08, 0x1C, 0x3E, 0x00, 0x3E, 0x1C, 0x08},  // перевернуть
       {0x08, 0x2A, 0x1C, 0x77, 0x1C, 0x2A, 0x08},  // свет
       {0x1C, 0x22, 0x22, 0x7F, 0x77, 0x77, 0x7F},  // замок
+      {0x0E, 0x1C, 0x38, 0x3E, 0x0E, 0x18, 0x20},  // молния
       {0x1C, 0x7F, 0x22, 0x2A, 0x2A, 0x22, 0x3E}}; // корзина
-    const int sec = sel <= MARIO ? 0 : sel == AI ? 1 : 2;
+    const int sec = sel <= MARIO ? 0 : sel <= AIMEM ? 1 : 2;
     for (int t = 0; t < 3; t++) {  // вкладки разделов
       int x = TX[t], w = TW[t], tx = x + (w - 6 * u8::length(TAB[t])) / 2;
       if (t == sec) { o.rect(x + 1, 0, x + w - 2, 7, OLED_FILL); o.rect(x, 1, x + w - 1, 7, OLED_FILL); o.invertText(true); }
@@ -2446,6 +2458,10 @@ class App : public WebHooks {
     files.openAt(settings.lastFile);
     oled.setContrast(settings.brightness);
     applyOrientation();
+    analogSetPinAttenuation(cfg::PIN_BAT, ADC_11db);
+    battLoad();
+    battWinAt = millis();
+    battUpdate(millis(), true);
     lastActivity = millis();
     draw();
   }
@@ -2466,6 +2482,7 @@ class App : public WebHooks {
       else enterLightSleep();
     }
 
+    if (battUpdate(now, false) && !dark && (state == ST_LIST || state == ST_MARK || state == ST_BATT)) draw();
     handleButtons(now);
     if (state == ST_FLAPPY) {
       lastActivity = now;
@@ -2501,7 +2518,7 @@ class App : public WebHooks {
   void sleepChanged() override { lastActivity = millis(); }
 
  private:
-  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_FLAPPY, ST_TETRIS, ST_PROMPT, ST_MARIO, ST_AIKB, ST_HUB };
+  enum State { ST_LIST, ST_VIEW, ST_WIFI, ST_CALC, ST_MARK, ST_CONFIRM, ST_FLAPPY, ST_TETRIS, ST_PROMPT, ST_MARIO, ST_AIKB, ST_HUB, ST_BATT };
 
   Oled oled;
   Settings settings;
@@ -2515,6 +2532,10 @@ class App : public WebHooks {
   Hub hub;
   bool aiAnswer = false, aiSaved = false;  // показан ответ ИИ / он уже сохранён в файлы
   bool backHub = false;  // запуск из меню 0000: выход возвращает в меню
+  bool aiMem = false;  // чат с памятью истории
+  struct Turn { String q, a; };
+  Turn aiHist[cfg::AI_HIST_N];
+  int aiHistN = 0;
   bool aiView = false;  // после ответа ИИ вернуться к клавиатуре
   WebUI web;
   Button up, down, ok;
@@ -2553,7 +2574,8 @@ class App : public WebHooks {
   void draw() {
     oled.clear();
     switch (state) {
-      case ST_LIST: case ST_MARK: files.draw(oled); break;
+      case ST_LIST: case ST_MARK: files.draw(oled, 3); drawBattIcon(113, 0); break;
+      case ST_BATT: drawBattScreen(); break;
       case ST_CONFIRM: drawConfirm(); break;
       case ST_FLAPPY: flappy.draw(oled); break;
       case ST_TETRIS: tetris.draw(oled); break;
@@ -2565,6 +2587,86 @@ class App : public WebHooks {
       case ST_CALC: calc.draw(oled); break;
     }
     oled.update();
+  }
+
+  float battV = 0, battSum = 0, battSaved = 0;  // battV - показываемое напряжение, держится между обновлениями
+  int battPct = 0, battLastPct = -1, battLastCv = -1, battCnt = 0, battWin = 0;
+  uint32_t battAt = 0, battWinAt = 0;
+
+  // типовая кривая LiPo (350 мАч, небольшой ток): 3.5 В = 1%, 4.15 В = 100%
+  static int battPercent(float v) {
+    static const float V[] = {3.50f, 3.61f, 3.69f, 3.73f, 3.77f, 3.80f, 3.84f, 3.87f, 3.95f, 4.02f, 4.08f, 4.15f};
+    static const int P[] = {1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+    const int N = sizeof V / sizeof V[0];
+    if (v <= V[0]) return 1;
+    if (v >= V[N - 1]) return 100;
+    int i = 1;
+    while (v > V[i]) i++;
+    return P[i - 1] + (int)((v - V[i - 1]) / (V[i] - V[i - 1]) * (P[i] - P[i - 1]) + 0.5f);
+  }
+
+  void battSave() {
+    File f = LittleFS.open(cfg::BAT_PATH, "w");
+    if (f) { f.printf("%.3f\n", battV); f.close(); }
+    battSaved = battV;
+  }
+
+  void battLoad() {  // значение, которое было на экране до выключения
+    if (!LittleFS.exists(cfg::BAT_PATH)) return;
+    File f = LittleFS.open(cfg::BAT_PATH, "r");
+    if (!f) return;
+    const float v = f.parseFloat();
+    f.close();
+    if (v >= cfg::BAT_MIN_OK && v <= cfg::BAT_MAX_OK) { battV = v; battSaved = v; }
+  }
+
+  // замер раз в 2 с; на экране значение обновляется средним за окно (10 с, затем 30 с, затем 60 с);
+  // true - значение на экране изменилось
+  bool battUpdate(uint32_t now, bool force) {
+    if (!force && now - battAt < 2000) return false;
+    battAt = now;
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i++) sum += analogReadMilliVolts(cfg::PIN_BAT);
+    const float v = sum / 16.0f * cfg::BAT_RATIO / 1000.0f + 0.13f; //НЕОБХОДИМО НАСТРАИВАТЬ ВРУЧНУЮ НА КАЖДОЕ УСТРОЙСТВО!!!!!
+    if (v >= cfg::BAT_MIN_OK && v <= cfg::BAT_MAX_OK) { battSum += v; battCnt++; }  // мусор не берём
+    if (battV < 1.0f) {  // значения ещё нет: первый нормальный замер показываем сразу
+      if (!battCnt) return false;
+      battV = battSum / battCnt; battSum = 0; battCnt = 0; battWinAt = now; battSave();
+    } else if (now - battWinAt >= cfg::BAT_WIN_S[battWin] * 1000UL) {  // окно закончилось: берём среднее
+      if (battCnt) { battV = battSum / battCnt; if (fabsf(battV - battSaved) >= 0.03f) battSave(); }
+      battSum = 0; battCnt = 0; battWinAt = now;
+      if (battWin < (int)(sizeof cfg::BAT_WIN_S / sizeof cfg::BAT_WIN_S[0]) - 1) battWin++;
+    }
+    battPct = battPercent(battV);
+    const int cv = (int)(battV * 100 + 0.5f);
+    const bool changed = battPct != battLastPct || cv != battLastCv;
+    battLastPct = battPct; battLastCv = cv;
+    return changed;
+  }
+
+  void drawBattIcon(int x, int y) {  // 15x7: корпус 13 + носик 2
+    oled.rect(x, y, x + 12, y + 6, OLED_FILL);
+    oled.rect(x + 1, y + 1, x + 11, y + 5, OLED_CLEAR);
+    oled.rect(x + 13, y + 2, x + 14, y + 4, OLED_FILL);
+    int w = (battPct * 9 + 50) / 100;
+    if (w < 1) w = 1;
+    oled.rect(x + 2, y + 2, x + 1 + w, y + 4, OLED_FILL);
+  }
+
+  void drawBattScreen() {
+    char b[32];
+    oled.setCursor(0, 0); oled.print("Напряжение");
+    oled.rect(4, 14, 116, 38, OLED_FILL);    // корпус
+    oled.rect(6, 16, 114, 36, OLED_CLEAR);
+    oled.rect(117, 21, 121, 31, OLED_FILL);  // носик
+    int w = battPct * 105 / 100;
+    if (w < 1) w = 1;
+    oled.rect(8, 18, 7 + w, 34, OLED_FILL);
+    snprintf(b, sizeof b, "~%d мАч из %d", battPct * cfg::BAT_MAH / 100, cfg::BAT_MAH);
+    oled.setCursor((128 - 6 * u8::length(b)) / 2, 5); oled.print(b);
+    snprintf(b, sizeof b, "%.2f В   %d%%", battV, battPct);
+    oled.setCursor((128 - 6 * u8::length(b)) / 2, 6); oled.print(b);
+    oled.setCursor(0, 7); oled.print("ОК - назад");
   }
 
   void drawConfirm() {
@@ -2601,12 +2703,15 @@ class App : public WebHooks {
       case Hub::TETRIS: tetris.best = settings.tetBest; tetris.reset(); state = ST_TETRIS; break;
       case Hub::MARIO: mario.best = settings.marBest; mario.start(); state = ST_MARIO; break;
       case Hub::AI:
+      case Hub::AIMEM:
+        aiMem = id == Hub::AIMEM;
         if (!settings.aiReady()) showText("ИИ", "ИИ не настроен. Зажмите ОК в списке файлов, подключитесь к Wi-Fi устройства, откройте 192.168.4.1/settings и заполните: имя сети с интернетом, пароль и API-ключ ProxyAPI.", false);
         else { kb.clear(); kb.open(); state = ST_AIKB; }
         break;
       case Hub::FLIP: settings.leftHanded = !settings.leftHanded; applyOrientation(); settings.touch(millis()); break;
       case Hub::RGB: rgbOn = !rgbOn; if (!rgbOn) neopixelWrite(cfg::PIN_RGB, 0, 0, 0); break;
       case Hub::RGBPIN: settings.rgbBoot = !settings.rgbBoot; settings.touch(millis()); if (settings.rgbBoot) rgbOn = true; break;
+      case Hub::VOLT: state = ST_BATT; break;
       case Hub::DELETE: backHub = false; files.beginMark(); state = ST_MARK; break;
     }
   }
@@ -2678,6 +2783,10 @@ class App : public WebHooks {
       Button &bl = settings.leftHanded ? down : up, &br = settings.leftHanded ? up : down;
       mario.inL = bl.stable; mario.inR = br.stable; mario.inA = ok.stable;
       if (ok.pressed) mario.jump();
+      return;
+    }
+    if (state == ST_BATT) {  // экран напряжения: ОК - назад в меню
+      if (ok.longPress || (ok.released && !ok.longFired)) { state = ST_HUB; draw(); }
       return;
     }
     if (state == ST_HUB) {  // меню 0000: ▲▼ выбор, ОК действие, зажать ОК - выход
@@ -2886,6 +2995,29 @@ class App : public WebHooks {
     else { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
   }
 
+  static void jsonEsc(String &o, const char *s) {
+    for (; *s; s++) {
+      const uint8_t c = (uint8_t)*s;
+      if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+      else if (c == '\n') o += "\\n";
+      else if (c == '\r') o += "\\r";
+      else if (c == '\t') o += "\\t";
+      else if (c >= 0x20) o += (char)c;
+      else o += ' ';
+    }
+  }
+  size_t aiHistBytes() const { size_t n = 0; for (int i = 0; i < aiHistN; i++) n += aiHist[i].q.length() + aiHist[i].a.length(); return n; }
+  void aiHistDropOldest() {
+    if (!aiHistN) return;
+    for (int i = 0; i + 1 < aiHistN; i++) { aiHist[i].q = std::move(aiHist[i + 1].q); aiHist[i].a = std::move(aiHist[i + 1].a); }
+    aiHist[--aiHistN] = Turn();
+  }
+  void aiHistPush(const char *q, const String &a) {
+    if (aiHistN == cfg::AI_HIST_N) aiHistDropOldest();
+    aiHist[aiHistN].q = q; aiHist[aiHistN].a = a; aiHistN++;
+    while (aiHistN > 1 && aiHistBytes() > cfg::AI_HIST_BYTES) aiHistDropOldest();
+  }
+
   void aiAsk(const char *q) {
     const bool apWas = web.active();
     drawStatus("Подключение", "к Wi-Fi", 0);
@@ -2907,24 +3039,19 @@ class App : public WebHooks {
       return;
     }
     drawStatus("Запрос к ИИ", "ждите ответ", 1);
-    String body;
-    body.reserve(strlen(q) + 400);
-    // ProxyAPI принимает OpenAI Chat Completions на /v1/chat/completions.
-    // Для короткого имени явно добавляем вендора OpenAI.
+    String qe; jsonEsc(qe, q);
+    if (aiMem) while (aiHistN && qe.length() + aiHistBytes() * 11 / 10 + 40000 > ESP.getMaxAllocHeap()) aiHistDropOldest();  // не больше, чем влезет в кучу
     String modelId = settings.model;
     if (modelId.indexOf('/') < 0) modelId = String("openai/") + modelId;
+    String body;
+    body.reserve(qe.length() + (aiMem ? aiHistBytes() * 11 / 10 + aiHistN * 60 : 0) + 700);
     body += "{\"model\":\""; body += modelId;
-    body += "\",\"max_tokens\":600,\"messages\":[{\"role\":\"system\",\"content\":\"Ты помощник на маленьком OLED-экране. Отвечай кратко и по делу на языке вопроса, простым текстом: без markdown, без звёздочек, без эмодзи.\"},{\"role\":\"user\",\"content\":\"";
-    for (const char *p = q; *p; p++) {
-      const uint8_t c = (uint8_t)*p;
-      if (*p == '"' || *p == '\\') { body += '\\'; body += *p; }
-      else if (c == '\n') body += "\\n";
-      else if (c == '\r') body += "\\r";
-      else if (c == '\t') body += "\\t";
-      else if (c >= 0x20) body += *p;
-      else body += ' ';
+    body += "\",\"max_tokens\":600,\"messages\":[{\"role\":\"system\",\"content\":\"Ты помощник на маленьком OLED-экране. Отвечай кратко и по делу на языке вопроса, простым текстом: без markdown, без звёздочек, без эмодзи.\"}";
+    if (aiMem) for (int i = 0; i < aiHistN; i++) {
+      body += ",{\"role\":\"user\",\"content\":\""; jsonEsc(body, aiHist[i].q.c_str()); body += "\"}";
+      body += ",{\"role\":\"assistant\",\"content\":\""; jsonEsc(body, aiHist[i].a.c_str()); body += "\"}";
     }
-    body += "\"}]}";
+    body += ",{\"role\":\"user\",\"content\":\""; body += qe; body += "\"}]}";
     WiFiClientSecure cli;
     cli.setInsecure();  // без проверки сертификата (экономит память и не требует хранить корневые сертификаты)
     HTTPClient http;
@@ -2942,6 +3069,7 @@ class App : public WebHooks {
     aiDisconnect(apWas);
     String ans;
     if (code == 200 && aijson::str(resp.c_str(), "content", ans, strstr(resp.c_str(), "\"message\"")) && ans.length()) {
+      if (aiMem) aiHistPush(q, ans);
       kb.clear();
       showText("Ответ ИИ", ans, true);
       aiAnswer = true; aiSaved = false;
